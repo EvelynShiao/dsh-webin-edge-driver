@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+node_modules/
+*.log
+.DS_Store
+*.bak-*

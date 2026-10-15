@@ -1,0 +1,1028 @@
+/**
+ * dsh-webin 的「真 Edge」驱动器（edge-driver）
+ * ============================================
+ *
+ * ## 这是什么
+ *
+ * webin 原版把「真浏览器」这一手交给 DSH **桌面版（Electron）** 的 webview guest ——
+ * 而这个环境是 **web 档案（纯 Node）**，没有 `globalThis.dshDesktop`，
+ * 于是 client 半在 `desktopBrowser()` 直接 return，面板永远不挂载 ⇒ LDW 登不上。
+ *
+ * 本文件在 **host 半** 里补一只「手」：用 CDP 驱动**本机真 Edge** 去干
+ * webin 原本让 webview 干的活 —— 领活、填字、点发送、读回复、交结果。
+ *
+ * ## 为什么这不破坏 webin 的优势（用户明确要求）
+ *
+ * | webin 的优势 | 本驱动 |
+ * |---|---|
+ * | 真浏览器、真打字、真点发送 | ✅ 真 Edge，**脚本逐字复用 client.js 的原生脚本** |
+ * | 不伪造 header、不自己拼请求 | ✅ 一样。请求是页面自己发的 |
+ * | 从 hook 读流式回复 | ✅ 注入的还是 webin 原生 `buildDeepSeekHook` |
+ * | 差分发送 / 工具调用 / 会话绑定 | ✅ 全在 host 半，本文件一行不碰 |
+ * | 2~4 秒随机间隔、串行 | ✅ 照抄 `sendDelayMinMs`/`MaxMs` 配置 |
+ *
+ * **换掉的只有「脚本在哪个 Chromium 里跑」**，脚本本身来自
+ * `edge-driver-scripts.js`（逐字提取自 dsh-webin v0.2.23 lib/client.js，未改写）。
+ *
+ * ## 按需启动 / 用完即退（用户对常驻进程敏感）
+ *
+ * - 平时**不跑**：没有 Edge、没有后台服务
+ * - 有任务要跑时：`ensureEdge()` 起一个**独立 profile** 的 Edge（`.dsh/edge-ldw`）
+ * - `idleShutdownMs` 内没有任务：自动关掉那只 Edge（释放内存）
+ * - 登录态写在独立 profile 目录里 ⇒ 跨重启存活
+ *
+ * ## 安全边界
+ *
+ * - 只用**独立 profile 目录**（`--user-data-dir=<DSH_HOME>/edge-ldw`），
+ *   **绝不碰用户日常 Edge 的 profile**
+ * - 只在 `--remote-debugging-port` 的本地端口上通信（默认 127.0.0.1:9411）
+ * - 关闭时优先走 CDP `Browser.close`（让 Edge 正常写盘，登录态不丢）
+ */
+
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import {
+  DRIVER_SOURCE,
+  buildProbeScript,
+  buildSnapshotScript,
+  buildDrainScript,
+  buildScrollScript,
+  buildScrapeScript,
+  buildFillScript,
+  buildTriggerScript,
+  buildClearInputScript,
+  buildThinkingScript,
+  buildStopScript,
+  buildContinueScript,
+  buildChromeUserAgent,
+  buildDeepSeekHook,
+} from "./edge-driver-scripts.js";
+
+// ─────────────────────────────────────────────────────────────
+// 默认配置
+// ─────────────────────────────────────────────────────────────
+
+export const EDGE_DRIVER_DEFAULTS = {
+  /** 开不开。false = 完全不动（回到 webin 原版行为）。 */
+  enabled: true,
+  /** 调试端口（只监听本机）。 */
+  port: 9411,
+  /** Edge 可执行文件；留空 = 自动探测。 */
+  executable: "",
+  /** 独立 profile 目录；留空 = <DSH_HOME>/edge-ldw。 */
+  userDataDir: "",
+  /**
+   * 把工作窗口藏到屏幕外。
+   *
+   * ## 为什么用「屏幕外」而不是 `--headless`
+   *
+   * `--headless` 是**最典型的机器人特征**（`navigator.webdriver`、UA 里的
+   * `HeadlessChrome`、缺失的 GPU 信息），一开就等于自毁 webin 的反封优势。
+   *
+   * 而「把窗口移到屏幕外」：
+   *   - 页面仍处于 **visible** 状态（`document.visibilityState === 'visible'`）
+   *     —— 和真实用户把窗口拖到第二屏、或放在另一个虚拟桌面上一样
+   *   - GPU / WebGL / UA / 字体全部不变 ⇒ **指纹零变化**
+   *   - 你看不到它，但它是个货真价实的可见窗口
+   *
+   * ⚠️ 必须同时关掉后台节流（见启动参数），否则屏幕外的窗口会被 Chromium
+   * 降频，定时器变慢、渲染停滞，页面会「假死」。
+   */
+  hideWindow: true,
+  /**
+   * ## 自动清理网页版里的废对话 ⭐（用户点名要的）
+   *
+   * 每开一个新 DSH 会话，网页版就多一条对话。用久了账号里全是垃圾：
+   * 「测试正常」「链路通畅」这种一句话对话能堆几十条。
+   *
+   * 打开后：**任务跑完就删掉本轮新建的那条网页对话**。
+   *
+   * ## 安全边界（重要）
+   *
+   *   - 只删**本轮新建**的（对比任务开始前后的会话列表，取差集）
+   *   - **绝不**碰任务开始前就存在的对话（你的历史一条不动）
+   *   - **绝不**碰置顶（pinned）的对话
+   *   - 删除接口来自实测：`POST /api/v0/chat_session/delete`
+   *     body `{chat_session_id}`，返回 `{code:0,biz_code:0}`
+   *
+   * ## 什么时候不该开
+   *
+   * 如果你**想留着**网页版里的对话记录回头翻（比如喜欢在网页版看历史），
+   * 就把它关掉。默认**开**，因为默认观点是「DSH 里的对话记录才是正本」。
+   */
+  autoDeleteSessions: true,
+  /**
+   * 刚建的对话可能还没被服务端收录（列表要过一会才出现），
+   * 所以删除前先等一小会儿再查。
+   */
+  sessionDeleteSettleMs: 4000,
+  /** 空闲多久自动关掉 Edge（毫秒）。0 = 不自动关。 */
+  idleShutdownMs: 300000,
+  /** 起 Edge 后等 CDP 端口可用的上限（毫秒）。 */
+  launchTimeoutMs: 30000,
+  /** 领活轮询间隔（毫秒）。 */
+  pollIntervalMs: 1500,
+  /** 首次领活宽限（毫秒）—— 与 webin 的 claimGraceMs 语义一致。 */
+  claimGraceMs: 20000,
+  /** 每个任务等回复的上限（毫秒）。 */
+  replyTimeoutMs: 600000,
+  /** 发送前随机延迟区间（毫秒）—— 照抄 webin 的真人节奏策略。 */
+  sendDelayMinMs: 2000,
+  sendDelayMaxMs: 4000,
+  /** 详细日志。 */
+  verboseLog: false,
+};
+
+const EDGE_CANDIDATES = [
+  "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+];
+
+// ─────────────────────────────────────────────────────────────
+// 小工具
+// ─────────────────────────────────────────────────────────────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function dshHome() {
+  return process.env.DSH_HOME ?? join(homedir(), ".dsh");
+}
+
+function resolveEdgePath(configured) {
+  if (typeof configured === "string" && configured.trim() !== "" && existsSync(configured)) return configured;
+  for (const p of EDGE_CANDIDATES) if (existsSync(p)) return p;
+  return "";
+}
+
+function resolveUserDataDir(configured) {
+  if (typeof configured === "string" && configured.trim() !== "") return configured;
+  return join(dshHome(), "edge-ldw");
+}
+
+// ─────────────────────────────────────────────────────────────
+// CDP 客户端（只用 node 原生 WebSocket，无依赖）
+// ─────────────────────────────────────────────────────────────
+
+class CdpConnection {
+  constructor(ws) {
+    this.ws = ws;
+    this.seq = 0;
+    this.pending = new Map();
+    this.handlers = new Map();
+    this.closed = false;
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.id !== undefined && this.pending.has(m.id)) {
+        const p = this.pending.get(m.id);
+        this.pending.delete(m.id);
+        if (m.error) p.reject(new Error(`CDP ${m.error.message ?? JSON.stringify(m.error)}`));
+        else p.resolve(m.result);
+        return;
+      }
+      if (m.method && this.handlers.has(m.method)) {
+        for (const fn of this.handlers.get(m.method)) {
+          try { fn(m.params); } catch { /* 订阅者异常不能影响连接 */ }
+        }
+      }
+    };
+    ws.onclose = () => { this.closed = true; };
+    ws.onerror = () => { this.closed = true; };
+  }
+
+  static async connect(url, timeoutMs = 10000) {
+    const ws = new WebSocket(url);
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("CDP WebSocket 连接超时")), timeoutMs);
+      ws.onopen = () => { clearTimeout(t); resolve(); };
+      ws.onerror = () => { clearTimeout(t); reject(new Error("CDP WebSocket 连接失败")); };
+    });
+    return new CdpConnection(ws);
+  }
+
+  send(method, params = {}, timeoutMs = 30000) {
+    if (this.closed) return Promise.reject(new Error("CDP 连接已关闭"));
+    const id = ++this.seq;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} 超时`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(t); resolve(v); },
+        reject: (e) => { clearTimeout(t); reject(e); },
+      });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  on(method, fn) {
+    if (!this.handlers.has(method)) this.handlers.set(method, new Set());
+    this.handlers.get(method).add(fn);
+  }
+
+  off(method, fn) {
+    this.handlers.get(method)?.delete(fn);
+  }
+
+  close() { try { this.ws.close(); } catch { /* ignore */ } }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 驱动器
+// ─────────────────────────────────────────────────────────────
+
+export class EdgeDriver {
+  /**
+   * @param {object} opts
+   * @param {object} opts.config    - 已归一化的配置（含 claimGraceMs / replyTimeoutMs / sendDelay*）
+   * @param {object} opts.log       - { info?, warn?, debug?, error? }
+   * @param {(platformId:string)=>object|undefined} opts.getProvider - 取平台定义（拿 homeUrl / completionPath / stopPath）
+   */
+  constructor(opts = {}) {
+    this.config = { ...EDGE_DRIVER_DEFAULTS, ...(opts.config ?? {}) };
+    this.log = opts.log ?? {};
+    this.getProvider = opts.getProvider ?? (() => undefined);
+
+    this.proc = null;
+    this.conn = null;
+    this.targetId = null;
+    this.loopTimer = null;
+    this.idleTimer = null;
+    this.busy = false;
+    this.stopping = false;
+    this.startedAt = 0;
+    this.lastJobAt = 0;
+    this.stats = { claimed: 0, done: 0, failed: 0, launched: 0 };
+    this.pending = null; // { jobId, baselineCount, startedAt }
+    this.hookInjectedAt = 0;
+  }
+
+  // ── 对外：状态（给 /status 用）──────────────────────────────
+
+  status() {
+    return {
+      enabled: this.config.enabled === true,
+      source: DRIVER_SOURCE,
+      edgePath: resolveEdgePath(this.config.executable) || null,
+      userDataDir: resolveUserDataDir(this.config.userDataDir),
+      port: this._port ?? this.config.port,
+      platformId: this.platformId,
+      hideWindow: this.config.hideWindow === true,
+      windowHidden: this._windowHidden === true,
+      running: this.proc !== null || (this.conn !== null && this.conn.closed === false),
+      pid: this.proc?.pid ?? null,
+      cdpConnected: this.conn !== null && this.conn.closed === false,
+      targetUrl: this.targetUrl ?? null,
+      busy: this.busy,
+      pendingJobId: this.pending?.jobId ?? null,
+      stats: { ...this.stats },
+      uptimeMs: this.startedAt === 0 ? 0 : Date.now() - this.startedAt,
+      idleShutdownMs: this.config.idleShutdownMs,
+    };
+  }
+
+  get targetUrl() { return this._targetUrl ?? null; }
+
+  // ── 窗口可见性 ─────────────────────────────────────────────
+
+  /**
+   * 把工作窗口藏到屏幕外（或叫回来）。
+   *
+   * ## 为什么不用 `--headless` / `Browser.setWindowBounds` 到极小尺寸
+   *
+   * - `--headless`：最典型的机器人特征，等于自毁反封优势。**绝不用。**
+   * - 尺寸缩到 1×1：某些站点会检查窗口尺寸，且布局塌陷会让选择器失效。
+   * - **移到屏幕外**：页面完全正常渲染、`visibilityState` 仍是 `visible`、
+   *   指纹零变化 —— 只是你看不见它。
+   *
+   * 坐标用 `-24000` 这种远超任何真实显示器范围的值，确保不会误落在
+   * 第二屏或虚拟桌面上。同时保留正常窗口尺寸，布局不受影响。
+   *
+   * @param {boolean} hide - true = 藏起来，false = 叫回屏幕内
+   */
+  async setWindowVisible(hide) {
+    if (this.conn === null || this.conn.closed !== false) return false;
+    try {
+      const win = await this.conn.send("Browser.getWindowForTarget", { targetId: this.targetId }, 5000);
+      if (win?.windowId === undefined) return false;
+      const bounds = hide
+        ? { left: -24000, top: -24000, width: 1100, height: 820, windowState: "normal" }
+        : { left: 80, top: 60, width: 1100, height: 820, windowState: "normal" };
+      await this.conn.send("Browser.setWindowBounds", { windowId: win.windowId, bounds }, 5000);
+      this._windowHidden = hide === true;
+      return true;
+    } catch (e) {
+      this.log.debug?.(`[edge-driver] 设置窗口可见性失败（不影响干活）: ${String(e?.message ?? e)}`);
+      return false;
+    }
+  }
+
+  /** 把窗口叫到最前面（需要用户登录时用）。 */
+  async bringToFront() {
+    if (this.conn === null || this.conn.closed !== false) return false;
+    try {
+      await this.setWindowVisible(false);
+      await this.conn.send("Page.bringToFront", {}, 5000).catch(() => undefined);
+      this._windowHidden = false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 需要用户登录时：把窗口叫出来并置顶，让用户能看见、能操作。 */
+  async surfaceForLogin(provider) {
+    this.log.info?.("[edge-driver] 需要登录 —— 把 Edge 窗口叫到前台");
+    await this.bringToFront();
+    try {
+      const home = provider?.homeUrl ?? "https://chat.deepseek.com/";
+      await this.goto(home);
+    } catch { /* 导航失败也不影响用户手动操作 */ }
+    return true;
+  }
+
+  // ── 启动 ───────────────────────────────────────────────────
+
+  /** 起 Edge（如果还没起）+ 连 CDP + 定位到聊天页。幂等。 */
+  async ensureEdge(platformId) {
+    if (this.config.enabled !== true) throw new Error("edge-driver 未启用");
+
+    /**
+     * ## 多平台：一个平台一只 Edge（独立 profile + 独立端口）
+     *
+     * 为什么必须分开：webin 的设计就是**一个平台一个独立浏览器环境**
+     * （原版用 `browser.acquire(provider.id)` 按 workspace 名缓存 partition），
+     * 这样多平台登录互不干扰。驱动器照抄这个语义：
+     *
+     *   - deepseek → profile `<DSH_HOME>/edge-ldw/deepseek`，端口 9411
+     *   - qwen     → profile `<DSH_HOME>/edge-ldw/qwen`，     端口 9412
+     *   - 第 N 个   → 端口 9411 + N
+     *
+     * ⚠️ 换平台时必须先关掉上一个平台的 Edge，否则多个 Edge 抢同一个
+     * profile 目录会互相顶掉（Edge 是单例，后启动的会把自己转交给先启动的）。
+     */
+    const wanted = typeof platformId === "string" && platformId !== "" ? platformId : this.platformId;
+    if (wanted !== this.platformId) {
+      this.log.info?.(`[edge-driver] 切换平台 ${this.platformId} → ${wanted}，先收掉上一个浏览器`);
+      await this.shutdownEdge("切换平台");
+      this.platformId = wanted;
+    }
+    /** 当前平台的端口与 profile（由 platformId 派生，保证一平台一套）。 */
+    const port = this.portFor(this.platformId);
+    const dir = this.userDataDirFor(this.platformId);
+
+    // ① 已经连上就直接复用。
+    if (this.conn !== null && this.conn.closed === false && this.proc !== null && this._port === port) return this;
+
+    // ② **先看端口**：可能是上一次留下的 Edge 还在跑（或用户自己起的）。
+    //    这时**绝不能再 spawn** —— Edge 是单例的，第二个进程发现同 profile
+    //    已有实例会立刻把请求转交过去然后**自己退出**，而退出回调会把
+    //    刚建立的 CDP 连接清掉（踩过这个坑：报 `Cannot read properties of null`）。
+    if (await this.portAlive(port)) {
+      this.log.info?.(`[edge-driver] 端口 ${port} 已有 Edge 实例，直接复用（不重复启动）`);
+      this._port = port;
+      await this.attach();
+      if (this.config.hideWindow === true) await this.setWindowVisible(true);
+      this.touchIdle();
+      return this;
+    }
+
+    const exe = resolveEdgePath(this.config.executable);
+    if (exe === "") throw new Error("找不到 msedge.exe —— 请在配置里填 executable");
+
+    mkdirSync(dir, { recursive: true });
+    this._port = port;
+
+    /**
+     * ## 启动参数：省内存优先，但**绝不碰指纹**
+     *
+     * 用户机器只剩 ~1.6 GB 可用，而一只 Edge 实测占 ~670 MB。这里关掉的全是
+     * **与页面渲染和指纹无关**的东西：
+     *
+     *   - `--disable-background-mode`     关掉后台预加载（Edge 关了窗口还赖着）
+     *   - `--disable-features=...`        关翻译 / 身份 / 预渲染等后台特性
+     *   - `--disable-backgrounding-occluded-windows` 页面被挡住时**不要**降频
+     *     （反直觉：这个开着反而更省，因为不降频就不会反复重绘恢复）
+     *   - `--no-service-autorun`          不自动跑后台服务
+     *   - `--disable-sync`                不跑同步（登录态是本地的，不需要）
+     *   - `--disk-cache-size` 限制磁盘缓存，别让它长到几百 MB
+     *
+     * ⚠️ **刻意不加**的（会改指纹，等于自毁 webin 的反封优势）：
+     *   - `--disable-gpu` / `--use-gl=swiftshader`（WebGL 指纹会变）
+     *   - `--user-agent=...`（UA 必须由真 Edge 自己给，保持与内核自洽）
+     *   - `--headless`（无头模式是最典型的机器人特征）
+     *   - `--disable-blink-features=AutomationControlled`（这个反而显眼）
+     */
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${dir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-mode",
+      "--no-service-autorun",
+      "--disable-sync",
+      /**
+       * ## ⚠️⚠️ 这几个是「屏幕外窗口」能正常干活的前提
+       *
+       * Chromium 会把**看不见的窗口**降频：定时器变慢（1s → 1min）、
+       * 渲染停滞、`requestAnimationFrame` 几乎不触发。而我们的页面被移到
+       * 屏幕外之后正好命中这个逻辑 —— 不关掉这些节流，页面会「假死」：
+       * 发送点了没反应、回复等不到。
+       *
+       *   - `--disable-background-timer-throttling`  定时器不降频
+       *   - `--disable-backgrounding-occluded-windows` 被遮挡也不降频
+       *   - `--disable-renderer-backgrounding`      渲染进程不降优先级
+       *
+       * 这三个**不改任何指纹**（它们是进程调度策略，页面 JS 探测不到），
+       * 也不影响 UA / WebGL / 字体 —— 纯粹让屏幕外的窗口保持全速运行。
+       */
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-features=Translate,msEdgeIdentityFeature,msEdgeSidebarFeature,EdgeCollections",
+      "--disk-cache-size=52428800",
+      "--window-size=1100,820",
+      ...(this.config.hideWindow === true ? ["--window-position=-24000,-24000"] : []),
+      "about:blank",
+    ];
+    this.log.info?.(`[edge-driver] 启动真 Edge: platform=${this.platformId} port=${port} profile=${dir} hide=${this.config.hideWindow === true}`);
+    // ⚠️ 沙箱下必须 stdio:'ignore'（走管道会 EPERM）；detached + unref 让 Edge 独立存活。
+    const proc = spawn(exe, args, { detached: true, stdio: "ignore", windowsHide: false });
+    proc.unref?.();
+    this.proc = proc;
+    this.startedAt = Date.now();
+    this.stats.launched++;
+    /**
+     * ⚠️ 退出回调**不能**顺手把 `conn` 清空。
+     *
+     * Edge 单例：如果同 profile 已有实例，这个进程会立刻退出（把请求转交过去），
+     * 而 CDP 其实连的是**那个还活着的**实例 —— 清空 conn 会把好好的连接掐掉。
+     * 这里只标记进程没了；连接的有效性由 `conn.closed` 自己说话。
+     */
+    proc.on?.("exit", () => {
+      if (this.proc === proc) this.proc = null;
+    });
+
+    await this.waitForPort();
+    await this.attach();
+    /**
+     * 藏窗口：**必须在 attach 之后**（要拿 windowId 才能设位置）。
+     *
+     * 启动参数里已经给了 `--window-position=-24000,-24000`，但那只对
+     * **首次创建**生效；复用已有 Edge 时得靠这里再设一次。
+     */
+    if (this.config.hideWindow === true) await this.setWindowVisible(true);
+    this.touchIdle();
+    return this;
+  }
+
+  /** 探一下 CDP 端口通不通（不抛错）。 */
+  async portAlive(port) {
+    const p = port ?? this._port ?? this.config.port;
+    try {
+      const r = await fetch(`http://127.0.0.1:${p}/json/version`);
+      return r.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 某个平台用哪个调试端口。
+   *
+   * 一平台一端口，避免多平台抢同一个 CDP 端点。
+   * 顺序由 `_platformOrder` 决定（首次见到的平台排 0，第二个排 1…），
+   * 保证同一个平台每次拿到同一个端口（否则重启后端口漂移，复用逻辑会失效）。
+   */
+  portFor(platformId) {
+    const order = this._platformOrder ?? (this._platformOrder = new Map());
+    if (!order.has(platformId)) order.set(platformId, order.size);
+    return this.config.port + order.get(platformId);
+  }
+
+  /**
+   * 某个平台用哪个 profile 目录。
+   *
+   * 目录名用**平台 id**（不是随机值）—— 这样登录态跟着平台走，
+   * 重启后还在原地，不用重新登录。原版 webin 的 partition 是随机的
+   * 内存分区，那正是它「每次重启都要重新登录」的根因。
+   */
+  userDataDirFor(platformId) {
+    const base = resolveUserDataDir(this.config.userDataDir);
+    return join(base, String(platformId).replace(/[^A-Za-z0-9_-]/g, "_"));
+  }
+
+  /** 等 CDP 端口可用。 */
+  async waitForPort() {
+    const port = this._port ?? this.config.port;
+    const deadline = Date.now() + this.config.launchTimeoutMs;
+    let lastErr = "";
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${port}/json/version`);
+        if (r.ok) { await r.json(); return; }
+        lastErr = `HTTP ${r.status}`;
+      } catch (e) { lastErr = String(e?.message ?? e); }
+      await sleep(300);
+    }
+    throw new Error(`Edge 的 CDP 端口没起来（${port}）：${lastErr}`);
+  }
+
+  /** 找到/新建一个 page target，连上它。 */
+  async attach() {
+    const port = this._port ?? this.config.port;
+    const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    /**
+     * 优先挑**目标平台域名**的页面。
+     *
+     * 多平台时同一个 Edge 里可能开着别的站的标签 —— 必须挑对，
+     * 否则会把脚本打进错误的页面（发错网站）。
+     */
+    const provider = this.getProvider(this.platformId);
+    let wantRe = /chat\.deepseek\.com/;
+    try { if (provider?.urlPattern) wantRe = new RegExp(provider.urlPattern); } catch { /* 用默认 */ }
+    let page = list.find((t) => t.type === "page" && wantRe.test(String(t.url)) && t.webSocketDebuggerUrl);
+    if (page === undefined) page = list.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    if (page === undefined) throw new Error("Edge 里没有可用的 page target");
+
+    this.conn = await CdpConnection.connect(page.webSocketDebuggerUrl);
+    this.targetId = page.id;
+    this._targetUrl = page.url;
+    await this.conn.send("Page.enable");
+    await this.conn.send("Runtime.enable");
+    this.conn.on("Page.frameNavigated", (p) => {
+      if (p?.frame?.parentId === undefined) this._targetUrl = p.frame.url;
+    });
+    return this;
+  }
+
+  // ── 页面求值（等价于 webin 的 execJs）────────────────────────
+
+  async evalInPage(code, timeoutMs = 30000) {
+    const r = await this.conn.send("Runtime.evaluate", {
+      expression: code,
+      returnByValue: true,
+      awaitPromise: true,
+      userGesture: true,
+    }, timeoutMs);
+    if (r.exceptionDetails) {
+      const d = r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "unknown";
+      throw new Error(`页面脚本异常: ${String(d).slice(0, 300)}`);
+    }
+    return r.result?.value;
+  }
+
+  // ── 登录态 / 快照 ──────────────────────────────────────────
+
+  async probe() {
+    try {
+      return JSON.parse(String(await this.evalInPage(buildProbeScript(), 15000)));
+    } catch {
+      return { loggedIn: false };
+    }
+  }
+
+  /** 生成 webin 原生格式的快照（host 侧据此判断「登录过」）。 */
+  async snapshot() {
+    return await this.evalInPage(buildSnapshotScript(), 15000);
+  }
+
+  // ── 导航 ───────────────────────────────────────────────────
+
+  async goto(url) {
+    if (this.conn === null || this.conn.closed !== false) await this.ensureEdge();
+    const conn = this.conn;
+    await conn.send("Page.navigate", { url });
+    /**
+     * ⚠️ 用**一次性**监听器等 load 事件。
+     *
+     * `CdpConnection.on()` 是累加的 —— 早期写法每次 goto 都挂一个永久监听器，
+     * 一次会话跑几十轮就会堆几十个（内存泄漏，且每次导航触发全部）。
+     */
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; clearTimeout(t); conn.off("Page.loadEventFired", finish); resolve(); } };
+      const t = setTimeout(finish, 20000);
+      conn.on("Page.loadEventFired", finish);
+    });
+    this._targetUrl = url;
+  }
+
+  /** 注入 webin 原生 hook（幂等，自带 MARKER）。 */
+  async ensureHook(provider) {
+    const hook = buildDeepSeekHook(provider?.completionPath ?? "/api/v0/chat/completion", provider?.stopPath);
+    const r = await this.evalInPage(hook, 20000);
+    if (r !== "already-installed") this.hookInjectedAt = Date.now();
+    return r;
+  }
+
+  // ── 一个任务的完整生命周期 ─────────────────────────────────
+
+  /**
+   * 跑一个任务：填字 → 点发送 → 等回复 → 返回文本。
+   * @returns {Promise<{text:string, think:string, status:string, chatUrl:string, via:string}>}
+   */
+  async runJob(job, provider) {
+    const prompt = String(job.prompt ?? "");
+    if (prompt === "") throw new Error("任务没有 prompt");
+
+    // 0) 记住任务开始前网页里有哪些对话 —— 干完活好判断哪条是本轮新建的
+    if (this.config.autoDeleteSessions === true) {
+      this._sessionsBefore = await this.listSessions().catch(() => null);
+    }
+
+    // 1) 确认在正确的页面
+    const wantUrl = job.expectUrl;
+    if (typeof wantUrl === "string" && wantUrl !== "") {
+      const cur = String(await this.evalInPage("location.href", 10000));
+      if (cur !== wantUrl) await this.goto(wantUrl);
+    } else if (job.freshChat === true) {
+      await this.goto(provider?.homeUrl ?? "https://chat.deepseek.com/");
+    } else {
+      /**
+       * ⚠️ 兜底：既没有 `expectUrl` 也不是 `freshChat` 时，页面可能还停在
+       * `about:blank`（Edge 刚起来的样子）—— 这时 probe 一定读不到登录态，
+       * 会**误报「未登录」**。所以先确保落在目标域里。
+       */
+      const cur = String(await this.evalInPage("location.href", 10000).catch(() => ""));
+      let onTarget = false;
+      try {
+        onTarget = new RegExp(provider?.urlPattern ?? "chat\\.deepseek\\.com").test(cur);
+      } catch {
+        onTarget = /chat\.deepseek\.com/.test(cur);
+      }
+      if (!onTarget) await this.goto(provider?.homeUrl ?? "https://chat.deepseek.com/");
+    }
+    /** 导航后给页面一点时间落 DOM（首屏 + 登录态恢复）。 */
+    await sleep(1500);
+
+    // 2) 登录守卫 —— 未登录时把窗口叫出来让用户能登
+    const p = await this.probe();
+    if (p.loggedIn !== true) {
+      if (this.config.hideWindow === true) await this.surfaceForLogin(provider);
+      const err = new Error("LDW 页面未登录（跳到了登录页）。已把浏览器窗口叫到前台，请登录后重发。");
+      err.code = "WEBIN_NOT_LOGGED_IN";
+      throw err;
+    }
+
+    // 3) hook
+    await this.ensureHook(provider);
+
+    // 4) 基线：先读一次，记下现有回复条数
+    let baseline = 0;
+    try {
+      const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
+      baseline = typeof sc.count === "number" ? sc.count : 0;
+    } catch { /* 基线拿不到也不致命 */ }
+
+    // 5) 填字
+    const fill = JSON.parse(String(await this.evalInPage(buildFillScript(prompt), 20000)));
+    if (fill.ok !== true) {
+      throw new Error(`填入输入框失败：${fill.message ?? fill.stage ?? "未知"}`);
+    }
+
+    // 6) 真人节奏的随机延迟
+    const lo = Math.min(this.config.sendDelayMinMs, this.config.sendDelayMaxMs);
+    const hi = Math.max(this.config.sendDelayMinMs, this.config.sendDelayMaxMs);
+    const delay = lo + Math.floor(Math.random() * Math.max(1, hi - lo));
+    if (this.config.verboseLog) this.log.debug?.(`[edge-driver] 发送前等待 ${delay}ms`);
+    await sleep(delay);
+
+    // 7) 点火
+    const trig = JSON.parse(String(await this.evalInPage(buildTriggerScript(undefined, prompt), 20000)));
+    if (trig.ok !== true) {
+      throw new Error(`点击发送失败：${trig.message ?? trig.stage ?? "未知"}`);
+    }
+
+    // 8) 等回复（主路径：hook 事件；兜底：DOM 抓取）
+    const result = await this.waitForReply(job, baseline);
+
+    // 9) 清空输入框，为下一轮留干净状态
+    await this.evalInPage(buildClearInputScript(), 10000).catch(() => undefined);
+
+    /**
+     * 10) 清掉本轮在网页版新建的废对话。
+     *
+     * ⚠️ 放在最后、且**失败不影响结果** —— 清理是锦上添花，
+     * 绝不能因为它出错就把已经拿到的好回复丢掉。
+     */
+    if (this.config.autoDeleteSessions === true) {
+      try {
+        const removed = await this.purgeNewSessions();
+        if (removed > 0) this.log.info?.(`[edge-driver] 已清理 ${removed} 条网页版废对话`);
+      } catch (e) {
+        this.log.debug?.(`[edge-driver] 清理废对话失败（不影响本轮）: ${String(e?.message ?? e)}`);
+      }
+    }
+
+    return result;
+  }
+
+  // ── 网页版会话管理 ─────────────────────────────────────────
+
+  /**
+   * 确保当前页面**落在目标平台的域里**。
+   *
+   * ## 为什么每个跟页面打交道的方法都要先调它
+   *
+   * 两个坑：
+   *   1. Edge 刚起来时页面是 `about:blank` —— 读 `localStorage` 会抛
+   *      `SecurityError: Access is denied for this document`
+   *   2. 多平台时页面可能停在**上一个平台**的站点 —— 那时读到的是
+   *      别人的 storage、别人的 cookie，会去操作错误的账号
+   *
+   * 判据用 provider 的 `urlPattern`（webin 原生字段），命中就什么都不做。
+   */
+  async ensureOnTargetDomain() {
+    const provider = this.getProvider(this.platformId);
+    let cur = "";
+    try { cur = String(await this.evalInPage("location.href", 10000)); } catch { cur = ""; }
+    let onTarget = false;
+    try {
+      onTarget = new RegExp(provider?.urlPattern ?? "chat\\.deepseek\\.com").test(cur);
+    } catch {
+      onTarget = /chat\.deepseek\.com/.test(cur);
+    }
+    if (onTarget) return false;
+    this.log.debug?.(`[edge-driver] 页面在 ${cur}，导航到目标域`);
+    await this.goto(provider?.homeUrl ?? "https://chat.deepseek.com/");
+    /** 给首屏 + 登录态恢复一点时间。 */
+    await sleep(2500);
+    return true;
+  }
+
+  /**
+   * 列出网页版里的全部对话。
+   *
+   * 接口（实测）：`GET /api/v0/chat_session/fetch_page?count=50&page=N`
+   * 返回 `{data:{biz_data:{chat_sessions:[{id,title,updated_at,pinned}],has_more}}}`
+   *
+   * ⚠️ 必须在**页面上下文里**发请求（用页面的 fetch + localStorage 里的
+   * userToken）—— 这样才能带上完整的浏览器指纹与同源 cookie，
+   * 与 webin「不自己伪造请求」的原则一致。
+   */
+  async listSessions(maxPages = 10) {
+    /**
+     * ⚠️ 必须先确保在目标域里。
+     *
+     * `localStorage` 是**按源隔离**的：页面停在 `about:blank`（Edge 刚起来
+     * 的样子）时读它会抛 `SecurityError: Access is denied for this document`。
+     * 而且就算读到了，那也是**别的站**的 storage，不是我们要的。
+     */
+    await this.ensureOnTargetDomain();
+    const expr = `(async () => {
+      const raw = localStorage.getItem('userToken') || '{}';
+      let token = '';
+      try { token = JSON.parse(raw).value || ''; } catch (e) { token = ''; }
+      const H = { Authorization: 'Bearer ' + token, 'content-type': 'application/json' };
+      const out = [];
+      for (let page = 1; page <= ${Number(maxPages) || 10}; page++) {
+        const r = await fetch('/api/v0/chat_session/fetch_page?count=50&page=' + page, { headers: H });
+        if (!r.ok) break;
+        const j = await r.json();
+        const bd = j && j.data ? j.data.biz_data : null;
+        const ss = bd && Array.isArray(bd.chat_sessions) ? bd.chat_sessions : [];
+        if (ss.length === 0) break;
+        for (const s of ss) out.push({ id: s.id, title: s.title, updatedAt: s.updated_at, pinned: s.pinned === true });
+        if (!bd || bd.has_more !== true) break;
+      }
+      return JSON.stringify(out);
+    })()`;
+    const raw = await this.evalInPage(expr, 60000);
+    try { return JSON.parse(String(raw)); } catch { return []; }
+  }
+
+  /** 删一条网页版对话。返回是否成功。 */
+  async deleteSession(sessionId) {
+    if (typeof sessionId !== "string" || sessionId === "") return false;
+    await this.ensureOnTargetDomain();
+    const expr = `(async () => {
+      const raw = localStorage.getItem('userToken') || '{}';
+      let token = '';
+      try { token = JSON.parse(raw).value || ''; } catch (e) { token = ''; }
+      const r = await fetch('/api/v0/chat_session/delete', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_session_id: ${JSON.stringify(sessionId)} }),
+      });
+      const j = await r.json().catch(() => ({}));
+      const bd = j && j.data ? j.data.biz_code : undefined;
+      return String(r.status === 200 && (bd === 0 || bd === undefined));
+    })()`;
+    const ok = await this.evalInPage(expr, 30000).catch(() => false);
+    return ok === true || ok === "true";
+  }
+
+  /**
+   * 清掉**本轮新建**的网页对话（任务开始前后的差集）。
+   *
+   * ## 安全设计
+   *
+   *   - 差集 = 现在有、之前没有 ⇒ 只可能是本轮产生的
+   *   - 任务开始前的列表没拿到（`_sessionsBefore === null`）时**直接放弃**，
+   *     绝不「删最近的 N 条」这种危险策略
+   *   - 置顶的一律跳过
+   *
+   * @returns 实际删掉的条数
+   */
+  async purgeNewSessions() {
+    const before = this._sessionsBefore;
+    this._sessionsBefore = null;
+    if (!Array.isArray(before)) return 0;   // 没有基线 ⇒ 宁可不删，也不误删
+
+    /** 新建的对话可能要过一会儿才出现在列表里。 */
+    await sleep(Math.max(0, this.config.sessionDeleteSettleMs));
+
+    const after = await this.listSessions();
+    if (!Array.isArray(after) || after.length === 0) return 0;
+
+    const known = new Set(before.map((s) => s?.id).filter(Boolean));
+    const fresh = after.filter((s) => s?.id && !known.has(s.id) && s.pinned !== true);
+    let removed = 0;
+    for (const s of fresh) {
+      const ok = await this.deleteSession(s.id);
+      if (ok) removed++;
+      /** 一条一条来，别把接口打爆。 */
+      await sleep(600);
+    }
+    return removed;
+  }
+
+  /** 轮询等回复：优先读 hook 事件队列，其次读 DOM。 */
+  async waitForReply(job, baseline) {
+    const t0 = Date.now();
+    const limit = this.config.replyTimeoutMs;
+    let lastText = "";
+    let stable = 0;
+    let lastThink = "";
+
+    const drainExpr = `(() => {
+  const M = '__dshWebinHookInstalled__';
+  const evs = window[M + '_events'] || [];
+  let text = '', think = '', finished = false, status = '';
+  for (const e of evs) {
+    const d = e && e.detail ? e.detail : null;
+    if (!d) continue;
+    if (typeof d.text === 'string' && d.text !== '') text = d.text;
+    if (typeof d.think === 'string' && d.think !== '') think = d.think;
+    if (d.finished === true) finished = true;
+    if (typeof d.status === 'string' && d.status !== '') status = d.status;
+  }
+  return JSON.stringify({ text, think, finished, status, count: evs.length });
+})()`;
+
+    while (Date.now() - t0 < limit) {
+      if (this.stopping) {
+        // 被取消：按页面停止按钮，别再烧配额
+        await this.evalInPage(buildStopScript(), 10000).catch(() => undefined);
+        throw new Error("任务已取消（用户停止）");
+      }
+      await sleep(1500);
+
+      let drained = null;
+      try { drained = JSON.parse(String(await this.evalInPage(drainExpr, 15000))); } catch { /* 继续 */ }
+
+      let text = drained?.text ?? "";
+      let think = drained?.think ?? "";
+      const finished = drained?.finished === true;
+
+      if (text === "") {
+        // hook 没抓到 → DOM 兜底
+        try {
+          const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
+          if (typeof sc.last === "string" && sc.last !== "") text = sc.last;
+          if (typeof sc.think === "string" && sc.think !== "") think = sc.think;
+        } catch { /* 忽略 */ }
+      }
+
+      const chatUrl = String(await this.evalInPage("location.href", 8000).catch(() => ""));
+
+      // 登录页守卫（照抄 webin 的判据）
+      if (/sign[_-]?in|sign[_-]?up|\/login/i.test(chatUrl)) {
+        const err = new Error(`LDW 页面已掉线到登录页（${chatUrl}），本轮回复不可信。`);
+        err.code = "WEBIN_NOT_LOGGED_IN";
+        throw err;
+      }
+
+      const waited = Date.now() - t0;
+      if (text !== "" && text === lastText && finished === true) {
+        stable++;
+        if (stable >= 2) {
+          return { text, think: think || lastThink, status: "finished", chatUrl, via: drained?.text ? "hook" : "dom" };
+        }
+      } else {
+        stable = 0;
+      }
+      if (text !== "" && text === lastText && waited > 15000 && finished !== false) {
+        stable++;
+        if (stable >= 3) {
+          return { text, think: think || lastThink, status: "finished", chatUrl, via: drained?.text ? "hook" : "dom" };
+        }
+      } else if (text !== lastText) {
+        stable = 0;
+      }
+      lastText = text;
+      if (think !== "") lastThink = think;
+
+      if (this.config.verboseLog && text !== "") {
+        this.log.debug?.(`[edge-driver] 等回复 ${Math.round(waited / 1000)}s chars=${text.length} finished=${finished}`);
+      }
+    }
+    throw new Error(`等待网页回复超时（${Math.round(limit / 1000)} 秒）。`);
+  }
+
+  // ── 领活循环 ───────────────────────────────────────────────
+
+  /**
+   * 启动领活循环。
+   * @param {object} api - { claimNext(platform, sessionId, running), settle(id, result), shouldCancel(jobId) }
+   */
+  startLoop(api) {
+    if (this.loopTimer !== null) return;
+    this.stopping = false;
+    this.api = api;
+    const tick = async () => {
+      if (this.busy || this.stopping) return;
+      try {
+        await this.ensureEdge();
+        const provider = this.getProvider(this.platformId ?? "deepseek") ?? this.getProvider("deepseek");
+        const job = await api.claimNext(this.platformId ?? "deepseek", undefined, this.pending?.jobId);
+        if (job === undefined || job === null) { this.touchIdle(); return; }
+
+        this.busy = true;
+        this.pending = { jobId: job.id, startedAt: Date.now() };
+        this.stats.claimed++;
+        this.log.info?.(`[edge-driver] 领到任务 ${job.id}（${String(job.prompt ?? "").length} 字符）`);
+
+        try {
+          const r = await this.runJob(job, provider);
+          await api.settle(job.id, {
+            text: r.text, think: r.think, status: r.status,
+            ...(r.chatUrl === "" ? {} : { chatUrl: r.chatUrl }),
+          });
+          this.stats.done++;
+          this.log.info?.(`[edge-driver] 任务 ${job.id} 完成（${r.text.length} 字符，via ${r.via}）`);
+        } catch (e) {
+          this.stats.failed++;
+          const msg = String(e?.message ?? e);
+          this.log.warn?.(`[edge-driver] 任务 ${job.id} 失败: ${msg}`);
+          await api.settle(job.id, { error: msg });
+        } finally {
+          this.busy = false;
+          this.pending = null;
+          this.lastJobAt = Date.now();
+          this.touchIdle();
+        }
+      } catch (e) {
+        if (this.config.verboseLog) this.log.debug?.(`[edge-driver] 循环异常: ${String(e?.message ?? e)}`);
+      }
+    };
+    this.loopTimer = setInterval(() => void tick(), Math.max(500, this.config.pollIntervalMs));
+    void tick();
+  }
+
+  stopLoop() {
+    this.stopping = true;
+    if (this.loopTimer !== null) { clearInterval(this.loopTimer); this.loopTimer = null; }
+    if (this.idleTimer !== null) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+  }
+
+  /** 重置空闲计时器：到点就关掉 Edge 省内存。 */
+  touchIdle() {
+    if (this.idleTimer !== null) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+    const ms = this.config.idleShutdownMs;
+    if (!(ms > 0) || this.busy) return;
+    this.idleTimer = setTimeout(() => {
+      if (this.busy) return;
+      void this.shutdownEdge("空闲超时");
+    }, ms);
+  }
+
+  /** 正常关掉 Edge（走 CDP Browser.close，让 Edge 写盘 → 登录态不丢）。 */
+  async shutdownEdge(reason = "") {
+    if (this.conn === null && this.proc === null) return false;
+    this.log.info?.(`[edge-driver] 关闭 Edge${reason === "" ? "" : `（${reason}）`}`);
+    try {
+      if (this.conn !== null && this.conn.closed === false) {
+        // 用 browser 级 WebSocket 发 Browser.close
+        const port = this._port ?? this.config.port;
+        const v = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+        if (v?.webSocketDebuggerUrl) {
+          const bconn = await CdpConnection.connect(v.webSocketDebuggerUrl, 5000);
+          await bconn.send("Browser.close", {}, 5000).catch(() => undefined);
+          bconn.close();
+        }
+      }
+    } catch { /* 端口已经没了也无所谓 */ }
+    this.conn?.close();
+    this.conn = null;
+    this.proc = null;
+    this._targetUrl = null;
+    return true;
+  }
+}
+
+export default EdgeDriver;

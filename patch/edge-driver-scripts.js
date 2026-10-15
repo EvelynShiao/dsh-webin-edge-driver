@@ -1,0 +1,2804 @@
+// ⚠️ AUTO-EXTRACTED FROM dsh-webin v0.2.23 lib/client.js —— 逐字复制，未做任何改写。
+// 来源 rev: f8d00be9c5df   提取时间: 2026-10-15T07:17:06.557Z
+// 目的: 让 webin 的原生 DOM 脚本（真打字 / 真点击 / 真读取）在 CDP 驱动的真 Edge 里跑。
+// 若 dsh-webin 升级，本文件必须重新提取（DRIVER_SOURCE 记录提取来源）。
+export const DRIVER_SOURCE = { plugin: 'dsh-webin', version: '0.2.23', rev: 'f8d00be9c5df' };
+
+// —— 以下两个常量逐字复制自 client.js:10-12（hook 脚本依赖它们） ——
+/** 幂等标记：重复注入不重复打补丁。 */
+const MARKER = "__dshWebinHookInstalled__";
+/** 事件缓冲在 window 上的键名（与 hook 内一致）。 */
+const EVENT_QUEUE_KEY = `${MARKER}_events`;
+
+		function buildDeepSeekHook(completionPath, stopPath) {
+			return `(function () {
+  'use strict';
+  if (window.${MARKER}) return 'already-installed';
+  window.${MARKER} = true;
+
+  var COMPLETION = ${JSON.stringify(completionPath)};
+  var STOP = ${JSON.stringify(stopPath ?? "")};
+  var NS = 'dsh-webin';
+
+  // ---------- SSE 分帧：按空行切（\\n\\n 或 \\r\\n\\r\\n） ----------
+  function createFrameDecoder() {
+    var buffer = '';
+    var scanFrom = 0;
+    return {
+      push: function (text) {
+        buffer += text;
+        var frames = [];
+        var re = /\\r?\\n\\r?\\n/g;
+        var offset = 0;
+        var m;
+        re.lastIndex = scanFrom;
+        while ((m = re.exec(buffer)) !== null) {
+          frames.push(buffer.slice(offset, m.index));
+          offset = m.index + re.lastIndex - m.index;
+          offset = m.index + m[0].length;
+        }
+        buffer = buffer.slice(offset);
+        scanFrom = Math.max(0, buffer.length - 3);
+        return frames;
+      },
+      finish: function () {
+        var frames = [];
+        if (buffer) frames.push(buffer);
+        buffer = '';
+        scanFrom = 0;
+        return frames;
+      }
+    };
+  }
+
+  /** 取出 SSE 块里的 data: 行（多行用 \\n 拼接）。 */
+  function extractData(block) {
+    if (!block || !block.trim()) return null;
+    var data = null;
+    var lines = block.split(/\\r\\n|\\r|\\n/);
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf('data:') === 0) {
+        var d = lines[i].slice(5).trim();
+        data = data === null ? d : data + '\\n' + d;
+      }
+    }
+    return data;
+  }
+
+  function parseBlock(block) {
+    var data = extractData(block);
+    if (data === null || data === '[DONE]') return null;
+    try { return JSON.parse(data); } catch (e) { return null; }
+  }
+
+  // ---------- 请求识别 ----------
+  function samePath(url, path) {
+    try {
+      return new URL(String(url), location.href).pathname === path;
+    } catch (e) {
+      return String(url).indexOf(path) !== -1;
+    }
+  }
+
+  /**
+   * 记下**所有** POST 请求的路径（最近 20 条）。
+   *
+   * ## 为什么需要这个（用户实测踩过的坑）
+   *
+   * 用户症状：状态栏「已发送 · 收到 0 条」，网页版那边回复明明完成了，
+   * DSH 一直等到超时 —— 最难查的一类故障。
+   *
+   * 排查时最想知道的是：**页面到底往哪个路径发的请求？**
+   * 如果 DeepSeek 改了端点（比如加版本前缀），「samePath」 的**精确比较**
+   * 会静默失配 —— 既不报错也抓不到回复。
+   *
+   * 所以把所有 POST 路径记下来，诊断面板直接展示：
+   * 下次端点变了，一眼就能看出「真实路径 vs 我们期望的路径」。
+   */
+  function notePostPath(url) {
+    try {
+      var p;
+      try { p = new URL(String(url), location.href).pathname; }
+      catch (e) { p = String(url); }
+      var list = window.${MARKER}_postPaths;
+      if (!Array.isArray(list)) { list = []; window.${MARKER}_postPaths = list; }
+      var matched = samePath(url, COMPLETION);
+      /** 去重：同一路径只留一条，但保留「曾匹配过」与调用次数。 */
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].path === p) {
+          list[i].at = Date.now();
+          list[i].count = (list[i].count || 1) + 1;
+          if (matched) list[i].matched = true;
+          return;
+        }
+      }
+      list.push({ path: p, at: Date.now(), matched: matched, count: 1 });
+      if (list.length > 20) list.splice(0, list.length - 20);
+    } catch (e) { /* ignore */ }
+  }
+
+  /**
+   * 记一次「页面自己发出了 completion 请求」。
+   *
+   * 这是发送脚本判断发送成功的最强信号（见 chat.ts 的 verify()）。
+   * 只计数，不干预请求。
+   */
+  function noteCompletionRequest() {
+    try {
+      var n = window.${MARKER}_requests;
+      window.${MARKER}_requests = (typeof n === 'number' ? n : 0) + 1;
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- 回复提取 ----------
+  /**
+   * @param thinkingEnabled - 本轮请求体里的 thinking_enabled。
+   *
+   * ## ⭐⭐⭐ 为什么必须传进来（照参考实现 F25 的修复）
+   *
+   * 真实事故（参考实现 dsh-deepseek-web-login 用真实帧复现并记录）：
+   * **思考的归属完全依赖首帧快照里的 THINK fragment**。一旦那份快照没能进入
+   * 状态机（整帧丢失、或服务端先发了 fragments: []），fragmentTypes 就一直是
+   * 空的，而旧实现在「无 fragment 可续」时**无条件当正文发射** ⇒ **整段思考上屏**。
+   *
+   * 实测后果（参考实现记录）：一轮 2062 字符、两轮 10526 / 4360 字符**全部进正文**。
+   * 而 dsh-webin 的 route() 有一模一样的缺陷：
+   *
+   *     var kind = forceKind ?? (currentIsThink() ? 'think' : 'text');   // 空表 ⇒ 'text'
+   *
+   * ## 修法（照参考实现）
+   *
+   * 开了思考、但**还没有任何 fragment** 时，裸增量先**缓冲**，等 fragment 出现
+   * 再按它的类型定归属。未开思考时不缓冲（没有歧义），保持旧行为。
+   */
+  function createExtractor(thinkingEnabled) {
+    var text = '';
+    var think = '';
+    var finished = false;
+    var incomplete = false;
+    var businessError = null;
+
+    /**
+     * ## fragment 索引 → 类型 的映射（**修复思考丢失 / 围栏丢失的关键**）
+     *
+     * ## 实测现象（用户报的两个症状，同一根因）
+     *
+     * 1. 网页版显示了思考（「已思考（用时 1 秒）」），但 DSH 只收到 **2 个字符**
+     *    （就是「用户」两个字）。
+     * 2. 工具调用的围栏**开头的三个反引号丢了**：
+     *    实际收到的是「ldw + 换行 + const r = await pwsh(...)」开头，
+     *    于是解析器找不到 ldw 围栏，整段被当正文显示在对话区。
+     *
+     * ## 根因
+     *
+     * 网页版的 response.fragments 是**数组**，每个 fragment 有 type
+     * （THINK / RESPONSE）。SSE 里只有**首帧**带完整路径
+     * （response/fragments/-1/content），后续全是**裸增量帧**（没有 p）。
+     *
+     * 裸增量归给谁，只能靠「最近一次路径帧指向哪个 fragment」。
+     * 早期实现**没跟踪这个** —— 裸增量一律 text += v，于是：
+     *   - 思考的裸增量全被当正文 ⇒ think 只剩路径帧那一小段
+     *   - 正文的裸增量接在 ldw 后面 ⇒ 围栏看起来「丢了」
+     *
+     * ## 修法
+     *
+     * 维护 fragmentTypes[i]（类型表）与 currentIndex（当前指向）：
+     *   - 路径帧 response/fragments/&lt;i&gt;/&lt;field&gt; ⇒ 更新类型表并切 currentIndex
+     *   - -1 表示「最后一个 fragment」，解析成实际下标
+     *   - 裸增量按 fragmentTypes[currentIndex] 分流到 think / text
+     *
+     * 这样即使网页端只发一次路径帧，后续裸增量也能正确归位。
+     *
+     * ⚠️ 本注释在模板字符串内，**不能出现反引号**（会让构建报 PARSE_ERROR）。
+     */
+    var fragmentTypes = [];
+    var currentIndex = -1;
+
+    function lastSeg(p) { return typeof p === 'string' ? p.split('/').pop() : ''; }
+
+    /**
+     * 从路径里解析 fragment 下标。
+     *
+     * response/fragments/0/content  ⇒ 0
+     * response/fragments/-1/content ⇒ 最后一个（= fragmentTypes.length - 1）
+     *
+     * ## ⚠️ 「-1」 的语义（这里是第一个坑）
+     *
+     * 「-1」 意思是「最后一个 fragment」。但**首帧就是 「-1」** 时，
+     * 类型表还是空的 —— 早期实现返回 null，于是类型表**从未登记**，
+     * 后续裸增量全部走错分支（这正是思考只有 2 个字的根因）。
+     *
+     * 正确做法：「-1」 且表为空 ⇒ **分配下标 0**（第一个 fragment）。
+     *
+     * @returns 下标；不是 fragment 路径时返回 null。
+     */
+    function fragmentIndexOf(p) {
+      if (typeof p !== 'string') return null;
+      /**
+       * 正则必须双写反斜杠。
+       *
+       * 这段代码整体位于一个模板字符串里（函数开头那个 return 后面跟的反引号），
+       * 而模板字符串会吃掉一层转义：单写的斜杠转义会退化成裸斜杠，字符类转义
+       * 会退化成普通字母。注入到页面的脚本于是变成非法 JS，页面抛
+       * SyntaxError: Invalid regular expression flags，整个 hook 注入失败
+       * —— SSE 观察这条路径从来没生效过（实测踩到）。
+       *
+       * 本文件里 onAuthRoute 那处就是正确写法的样板（双写反斜杠）。
+       * 注意：本注释本身也在模板字符串里，所以这里不能出现反引号，也不能写
+       * 单反斜杠示例 —— 它们会被模板字符串提前终止或吃掉。
+       */
+      var m = /^response\\/fragments\\/(-?\\d+)\\//.exec(p);
+      if (m === null) return null;
+      var i = Number(m[1]);
+      if (i < 0) {
+        /** -1 = 最后一个。表为空时视为「第 0 个」（首帧就是 -1 的情况）。 */
+        return fragmentTypes.length > 0 ? fragmentTypes.length - 1 : 0;
+      }
+      return i;
+    }
+
+    /** 路径里的字段名是不是「思考」字段。 */
+    function isThinkField(p) {
+      var seg = lastSeg(p);
+      return seg === 'reasoning_content' || seg === 'thinking_content';
+    }
+
+    /** 路径里的字段名是不是「正文」字段。 */
+    function isTextField(p) {
+      var seg = lastSeg(p);
+      return seg === 'content' || seg === 'text' || seg === 'markdown' || seg === 'delta';
+    }
+
+    /** JSON Patch 路径 → 判断是不是正文/思考文本。 */
+    function classify(p) {
+      var seg = lastSeg(p);
+      var inResponse = typeof p === 'string' && (p === 'response' || p.indexOf('response/') === 0);
+      if (seg === 'reasoning_content' || seg === 'thinking_content') return 'think';
+      if (!inResponse) return null;
+      if (seg === 'content' || seg === 'text' || seg === 'markdown' || seg === 'delta') return 'text';
+      return null;
+    }
+
+    /** 当前 fragment 是不是思考。 */
+    function currentIsThink() {
+      if (currentIndex < 0 || currentIndex >= fragmentTypes.length) return false;
+      return String(fragmentTypes[currentIndex]).toUpperCase() === 'THINK';
+    }
+
+    /**
+     * ⭐⭐⭐ 通道未知时的暂存文本（照参考实现 F25）。
+     *
+     * 只在「本轮开了思考、但还没有任何 fragment」时使用 —— 正常流不会走到这里
+     * （首帧快照就带着 THINK fragment）。有了它，「快照丢失 ⇒ 整段思考进正文」
+     * 这条事故链就断了。
+     */
+    var orphanBuffer = '';
+    /** 是否正在缓冲（开了思考且还没有 fragment 类型可依据）。 */
+    function shouldBufferOrphan() {
+      return thinkingEnabled === true && fragmentTypes.length === 0;
+    }
+    /**
+     * 把暂存文本按**刚确定的 fragment 类型**归属并落盘。
+     * 在「fragment 类型表第一次有内容」时调用。
+     */
+    function flushOrphan() {
+      if (orphanBuffer === '') return;
+      var piece = orphanBuffer;
+      orphanBuffer = '';
+      /**
+       * ## ⚠️ 归属规则（这里原来有个 bug）
+       *
+       * 原实现调 route(piece) —— 而 route 在**类型表为空**时按
+       * currentIsThink() 判定，空表恒为 false ⇒ 孤儿文本进了正文。
+       * 那等于把「缓冲」这道修复又绕过去了。
+       *
+       * 正确归属（依据参考实现的真实帧观察）：
+       *   - 开了思考时，正常流的**首帧快照一定带 THINK fragment**
+       *     ⇒ 「整轮都没出现 fragment 类型」说明帧丢了/流断了，
+       *       此时孤儿文本**极可能是思考** ⇒ 归到 think
+       *   - 没开思考时没有歧义 ⇒ 归到正文（保持旧行为）
+       *
+       * 宁可把「疑似思考」放进 think（显示在思考区，不污染正文），
+       * 也不要反过来 —— 正文里混进思考是用户反复报过的症状。
+       */
+      /**
+       * ## 必须按围栏切开，不能整段归 think（我上一版就是这么错的）
+       *
+       * 上一版把孤儿整段归给 think —— 用户实测：思考完整了，但正文空了。
+       * 因为孤儿里**同时**装着思考和一个工具调用（ldw 围栏），整段归 think
+       * 就把围栏一起吞了，正文与工具调用全丢。
+       *
+       * 归属规则：
+       *   - 围栏**之前**的部分（若有）归 think（开了思考时）
+       *   - 围栏**起始**处及其后一律归 text（那里是工具调用 / 正文）
+       *   - 没有围栏时才整段按 thinkingEnabled 归属
+       *
+       * 注意：本注释在模板字符串内部，不能出现反引号。
+       */
+      /** 反引号用 fromCharCode 拼 —— 本代码在模板内部，字面反引号会终止模板。 */
+      var TICK = String.fromCharCode(96);
+      var fenceAt = piece.search(new RegExp(TICK + '{3}[ \\t]*ldw[ \\t]*\\r?\\n', 'i'));
+      if (fenceAt > 0 && thinkingEnabled === true) {
+        think += piece.slice(0, fenceAt);
+        text += piece.slice(fenceAt);
+      } else if (fenceAt === 0) {
+        /** 开头就是围栏 —— 纯工具调用，全部归正文。 */
+        text += piece;
+      } else {
+        var kind = thinkingEnabled === true ? 'think' : 'text';
+        if (kind === 'think') think += piece;
+        else text += piece;
+      }
+    }
+
+    /** 把一段文本按当前 fragment 类型分流。 */
+    function route(piece, forceKind) {
+      if (!piece) return;
+      /**
+       * ⚠️ 顺序要紧：**先判要不要缓冲**，再分流。
+       * 缓冲期间不能落盘，否则思考就进了正文（这正是要修的事故）。
+       */
+      if (forceKind === undefined || forceKind === null) {
+        if (shouldBufferOrphan()) {
+          orphanBuffer += piece;
+          return;
+        }
+      }
+      var kind = forceKind !== undefined && forceKind !== null ? forceKind : (currentIsThink() ? 'think' : 'text');
+      if (kind === 'think') think += piece;
+      else text += piece;
+    }
+
+    /**
+     * 帧是不是「裸文本增量」。
+     *
+     * ## ⚠️ 这是「DSH 只收到一个字」的根因（实测抓帧定位）
+     *
+     * 真浏览器抓下来的帧序列长这样：
+     *
+     *     [3]   p=response/fragments/-1/content  o=APPEND  v=渲染   ← 只有首帧带路径
+     *     [4]   p=undefined                      o=undefined  v=网页  ← 正文主体全是这种
+     *     [5]   p=undefined                      o=undefined  v=的
+     *     [6]   p=undefined                      o=undefined  v=流程
+     *     ...
+     *     [130] p=response                       o=BATCH   v=?
+     *     [131] p=response/status                o=SET     v=FINISHED
+     *
+     * 也就是说**正文的绝大部分是裸字符串帧**（没有 p，v 直接是要追加的文本）。
+     * 早期实现只认「带 p 且路径匹配」的帧，于是每个回复只能拿到**第一个字**
+     * —— 用户看到的就是「只回一个字」。
+     *
+     * 判据：没有 p、没有 o（或 o 为 APPEND）、v 是非空字符串。
+     * 注意必须**排除**状态/错误信封（那些有 code / data / p）。
+     */
+    function isBareTextDelta(obj) {
+      if (typeof obj.p === 'string') return false;
+      if (typeof obj.v !== 'string' || obj.v === '') return false;
+      if (typeof obj.code === 'number') return false;
+      if (obj.data !== undefined) return false;
+      // o 允许缺省或 APPEND；SET 会覆盖，不按增量处理
+      if (obj.o !== undefined && obj.o !== 'APPEND') return false;
+      return true;
+    }
+
+    /** 处理一条 SSE 帧。 */
+    function consume(obj) {
+      if (!obj || typeof obj !== 'object') return;
+
+      // 业务错误信封：{ code, msg, data: { biz_code, biz_msg } }
+      if (typeof obj.code === 'number' && obj.code !== 0 && !obj.p) {
+        businessError = String(obj.msg || ('code=' + obj.code));
+        return;
+      }
+      if (obj.data && typeof obj.data.biz_code === 'number' && obj.data.biz_code !== 0) {
+        businessError = String(obj.data.biz_msg || ('biz_code=' + obj.data.biz_code));
+        return;
+      }
+
+      // 状态帧
+      if (obj.p === 'response/status' || obj.p === 'quasi_status') {
+        if (obj.v === 'FINISHED') finished = true;
+        else if (obj.v === 'INCOMPLETE') { incomplete = true; finished = true; }
+        return;
+      }
+
+      // fragments 追加：{ p: 'response/fragments', o: 'APPEND', v: [ {type, content} ] }
+      if (obj.p === 'response/fragments' && obj.o === 'APPEND' && Array.isArray(obj.v)) {
+        for (var i = 0; i < obj.v.length; i++) {
+          var f = obj.v[i];
+          if (!f || typeof f !== 'object') continue;
+          var piece = typeof f.content === 'string' ? f.content : (typeof f.text === 'string' ? f.text : '');
+          /**
+           * ⚠️ **先登记类型再分流** —— 每个新 fragment 都要进类型表，
+           * 这样后续裸增量才知道自己该去哪（见 fragmentTypes 的说明）。
+           */
+          var idx = fragmentTypes.length;
+          fragmentTypes.push(typeof f.type === 'string' ? f.type : 'RESPONSE');
+          currentIndex = idx;
+          /** ⭐ 类型表刚有内容 ⇒ 把之前暂存的「孤儿文本」按现在的归属落盘。 */
+          flushOrphan();
+          if (!piece) continue;
+          route(piece, String(f.type).toUpperCase() === 'THINK' ? 'think' : 'text');
+        }
+        return;
+      }
+
+      // 快照：{ v: { response: { fragments: [...] } } }
+      if (obj.p === undefined && obj.v && typeof obj.v === 'object' && obj.v.response) {
+        var frags = obj.v.response.fragments;
+        if (Array.isArray(frags)) {
+          var t = '';
+          var k = '';
+          for (var j = 0; j < frags.length; j++) {
+            var g = frags[j];
+            if (!g || typeof g !== 'object') continue;
+            var s = typeof g.content === 'string' ? g.content : (typeof g.text === 'string' ? g.text : '');
+            /**
+             * 快照是权威全量：**重建类型表**（而不是叠加）。
+             * 否则重复快照会让类型表越堆越长，-1 会解析到错误下标。
+             */
+            fragmentTypes[j] = typeof g.type === 'string' ? g.type : 'RESPONSE';
+            if (!s) continue;
+            if (String(g.type).toUpperCase() === 'THINK') k += s;
+            else t += s;
+          }
+          fragmentTypes.length = frags.length;
+          currentIndex = frags.length - 1;
+          /** ⭐ 快照建立了类型表 ⇒ 落盘暂存文本。 */
+          flushOrphan();
+          if (t) text = t;
+          if (k) think = k;
+        }
+        return;
+      }
+
+      /**
+       * fragment 路径帧：response/fragments/&lt;i&gt;/&lt;field&gt;
+       *
+       * ⚠️ **这是修复思考丢失 / 围栏丢失的关键分支。**
+       *
+       * 网页端只在 fragment 开始时发一次带路径的帧，后续全是裸增量。
+       * 这里记下「当前指向哪个 fragment」以及「它是什么类型」，
+       * 裸增量才能正确分流到 think / text。
+       *
+       * 实测：-1 指「最后一个 fragment」。思考阶段它指向 THINK，
+       * 正文阶段指向 RESPONSE —— 所以**必须在切换时更新类型**。
+       */
+      var fragIdx = fragmentIndexOf(obj.p);
+      if (fragIdx !== null && typeof obj.v === 'string') {
+        currentIndex = fragIdx;
+        /**
+         * 该字段决定这个 fragment 是什么类型：
+         * reasoning_content ⇒ THINK；content / text ⇒ RESPONSE。
+         * 以字段为准（比 type 字段可靠 —— 路径帧不带 type）。
+         */
+        if (isThinkField(obj.p)) fragmentTypes[fragIdx] = 'THINK';
+        else if (isTextField(obj.p)) fragmentTypes[fragIdx] = 'RESPONSE';
+        /** ⭐ 路径帧给出了类型 ⇒ 落盘暂存文本。 */
+        flushOrphan();
+        var kindFrag = isThinkField(obj.p) ? 'think' : isTextField(obj.p) ? 'text' : null;
+        if (kindFrag === 'think') think += obj.v;
+        else if (kindFrag === 'text') {
+          if (obj.o === 'APPEND' || obj.o === undefined) text += obj.v;
+          else text = obj.v;
+        }
+        return;
+      }
+
+      // 直接路径写入：{ p: 'response/content', o: 'SET', v: '...' }
+      var kind = classify(obj.p);
+      if (kind !== null && typeof obj.v === 'string') {
+        if (kind === 'think') think = obj.v;
+        else if (obj.o === 'APPEND') text += obj.v;
+        else text = obj.v;
+        return;
+      }
+
+      /**
+       * **裸文本增量**（正文/思考的主体）—— 见 isBareTextDelta 的说明。
+       *
+       * ⚠️ **不能一律当正文**：按当前 fragment 类型分流。
+       * 早期实现写死 text += obj.v，导致两个症状（实测复现）：
+       *   1. 思考的裸增量全进正文 ⇒ think 只剩路径帧那 2 个字
+       *   2. 正文的裸增量接在 ldw 后面 ⇒ 工具围栏开头的三反引号看起来丢了
+       */
+      if (isBareTextDelta(obj)) {
+        route(obj.v);
+        return;
+      }
+    }
+
+    return {
+      consume: consume,
+      get text() { return text; },
+      get think() { return think; },
+      get finished() { return finished; },
+      get incomplete() { return incomplete; },
+      get businessError() { return businessError; },
+      /**
+       * ⭐ 结束时若还有暂存文本 ⇒ **兜底落盘**。
+       *
+       * 不能丢字：极端情况下整轮都没有 fragment 类型（页面改版 / 快照全丢），
+       * 那时宁可当正文交出去，也不能让它凭空消失。
+       */
+      flushOrphan: function () { flushOrphan(); },
+    };
+  }
+
+  // ---------- 事件派发 ----------
+  //
+  // CustomEvent 只在**本页面**内可见，跨不过 webview 边界。
+  // 所以两件事都做：
+  //   1. 派发 CustomEvent —— 页面内其它脚本可用（也便于 DevTools 手工监听调试）
+  //   2. 压进 window.__dshWebinEvents 环形缓冲 —— 宿主用 executeJavaScript 轮询取走
+  var lastStreamAt = 0;
+  var MAX_EVENTS = 200;
+
+  function emit(name, detail) {
+    var payload = { name: name, detail: detail, at: Date.now() };
+    try {
+      window.dispatchEvent(new CustomEvent(NS + ':' + name, { detail: detail }));
+    } catch (e) { /* ignore */ }
+    try {
+      var q = window.${MARKER}_events;
+      if (!q) { q = []; window.${MARKER}_events = q; }
+      q.push(payload);
+      if (q.length > MAX_EVENTS) q.splice(0, q.length - MAX_EVENTS);
+    } catch (e) { /* ignore */ }
+  }
+
+  /**
+   * ## 最近一次 completion 的 HTTP 状态码（官方 LlmFailure.status 就是它）
+   *
+   * ## 为什么需要
+   *
+   * 官方契约里 LlmFailure.status 是 HTTP 状态码 —— DSH 的重试策略据此分类
+   * （429 限流与 500 服务端错误的处理不同）。
+   *
+   * 而插件只从 DOM 读文本，拿不到状态码。唯一能拿到的地方就是 hook：
+   * 它包了页面的 fetch / XHR，res.status 与 this.status 就在手里。
+   *
+   * ## 为什么用「统一变量」而不是逐处传参
+   *
+   * 有三个发射点（fetch 非流式分支、XHR 分支、emitDone 主路径）。逐处传参要改
+   * 三个签名；统一变量只改一处赋值、一处读取，不容易漏。
+   *
+   * ⚠️ 本注释位于模板字符串内部，**不能出现反引号**（会提前终止模板）。
+   */
+  var lastHttpStatus = 0;
+
+  function emitStream(ex) {
+    var now = Date.now();
+    if (!ex.finished && now - lastStreamAt < 100) return;
+    lastStreamAt = now;
+    emit('stream', { text: ex.text, think: ex.think, finished: ex.finished });
+  }
+
+  function emitDone(ex, reason) {
+    if (ex.businessError) {
+      /** 带上 HTTP 状态码（大于 0 才带，避免把「没观察到」当成 0）。 */
+      emit('error', lastHttpStatus > 0
+        ? { message: ex.businessError, status: lastHttpStatus }
+        : { message: ex.businessError });
+      return;
+    }
+    emit('done', {
+      text: ex.text,
+      think: ex.think,
+      status: ex.incomplete ? 'incomplete' : (ex.finished ? 'finished' : 'unknown'),
+      reason: reason || null
+    });
+  }
+
+  /**
+   * ⭐ 从请求体里读 thinking_enabled。
+   *
+   * F25 的缓冲判据需要它：**开了思考才缓冲**（没开思考时没有歧义，保持旧行为）。
+   * 读不到就当未开启 —— 那样行为与旧版一致，不会更差。
+   */
+  function readThinkingEnabled(body) {
+    try {
+      if (typeof body !== 'string' || body === '') return false;
+      var j = JSON.parse(body);
+      return j && j.thinking_enabled === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ---------- 单次请求的观察会话 ----------
+  function watchResponse(response, onDone, thinkingEnabled) {
+    var ex = createExtractor(thinkingEnabled);
+    var decoder = createFrameDecoder();
+    var reader = response.body.getReader();
+    var dec = new TextDecoder();
+
+    function pump() {
+      return reader.read().then(function (r) {
+        if (r.done) {
+          var rest = decoder.finish();
+          for (var i = 0; i < rest.length; i++) {
+            var p = parseBlock(rest[i]);
+            if (p) ex.consume(p);
+          }
+          /**
+           * ⭐ 流结束前把**还在缓冲的孤儿文本**落盘。
+           *
+           * 漏了这一步会怎样（本测试抓到的）：孤儿既不进正文也不进思考，
+           * **整段内容凭空消失** —— 比放错位置更糟。
+           */
+          try { ex.flushOrphan(); } catch (e) { /* ignore */ }
+          emitDone(ex, 'eof');
+          if (onDone) onDone();
+          return;
+        }
+        var chunk = dec.decode(r.value, { stream: true });
+        var frames = decoder.push(chunk);
+        for (var j = 0; j < frames.length; j++) {
+          var parsed = parseBlock(frames[j]);
+          if (parsed) ex.consume(parsed);
+        }
+        emitStream(ex);
+        return pump();
+      });
+    }
+
+    return pump().catch(function (e) {
+      try { ex.flushOrphan(); } catch (e) { /* ignore */ }
+      emitDone(ex, 'read-error');
+      if (onDone) onDone();
+    });
+  }
+
+  // ---------- 猴补 fetch（只读，原样透传） ----------
+  var origFetch = window.fetch;
+  if (typeof origFetch === 'function') {
+    window.fetch = function (input, init) {
+      var url = typeof input === 'string' ? input
+        : (input && input.url) ? input.url
+        : (input && input.href) ? input.href : '';
+      var method = (init && init.method) || (input && input.method) || 'GET';
+      var p = origFetch.apply(this, arguments);
+
+      try {
+        if (String(method).toUpperCase() === 'POST') {
+          /** 记下路径（诊断用，见 notePostPath）。 */
+          notePostPath(url);
+        }
+        if (String(method).toUpperCase() === 'POST' && samePath(url, COMPLETION)) {
+          noteCompletionRequest();
+          p.then(function (res) {
+            /** 记下状态码 —— 官方 LlmFailure.status。放最前面，各分支都能用。 */
+            try { lastHttpStatus = res.status; } catch (e) { /* ignore */ }
+            if (!res || !res.body) {
+              // 非流式：可能是限流等业务错误，读一份副本
+              try {
+                res.clone().json().then(function (j) {
+                  var ex = createExtractor();
+                  ex.consume(j);
+                  if (ex.businessError) {
+                    emit('error', { message: ex.businessError, status: res.status });
+                  }
+                }).catch(function () {});
+              } catch (e) { /* ignore */ }
+              return;
+            }
+            /**
+             * ⭐ 把 thinking_enabled 传进去 —— F25 的缓冲判据依赖它。
+             * 不传的话 createExtractor 收到 undefined，缓冲永远不启用（修复失效）。
+             */
+            var te = readThinkingEnabled(
+              (init && typeof init.body === 'string' ? init.body : '') ||
+                (input && typeof input.body === 'string' ? input.body : ''),
+            );
+            // 必须 clone —— 页面自己要消费原 body，我们只看副本
+            try { watchResponse(res.clone(), undefined, te); } catch (e) { /* ignore */ }
+          }).catch(function () {});
+        }
+      } catch (e) { /* ignore */ }
+
+      return p;
+    };
+  }
+
+  // ---------- 猴补 XHR（只读，原样透传） ----------
+  var OrigXHR = window.XMLHttpRequest;
+  if (typeof OrigXHR === 'function') {
+    var origOpen = OrigXHR.prototype.open;
+    var origSend = OrigXHR.prototype.send;
+    var info = new WeakMap();
+
+    OrigXHR.prototype.open = function (method, url) {
+      try { info.set(this, { method: method, url: url }); } catch (e) { /* ignore */ }
+      return origOpen.apply(this, arguments);
+    };
+
+    OrigXHR.prototype.send = function (body) {
+      var meta = info.get(this);
+      /** ⭐ 记下请求体 —— F25 的缓冲判据要从里面读 thinking_enabled。 */
+      try {
+        if (meta) meta.body = body;
+      } catch (e) { /* ignore */ }
+      var isPost = meta && String(meta.method).toUpperCase() === 'POST';
+      /** 记下路径（诊断用）。 */
+      if (isPost) notePostPath(meta.url);
+      var isTarget = isPost && samePath(meta.url, COMPLETION);
+      if (isTarget) {
+        noteCompletionRequest();
+        var ex = createExtractor(readThinkingEnabled(meta && meta.body));
+        var decoder = createFrameDecoder();
+        var lastLen = 0;
+        var done = false;
+
+        this.addEventListener('readystatechange', function () {
+          if (this.readyState !== 3 && this.readyState !== 4) return;
+          var raw;
+          try { raw = this.responseText; } catch (e) { return; }
+          if (typeof raw !== 'string' || raw.length <= lastLen) return;
+          var chunk = raw.slice(lastLen);
+          lastLen = raw.length;
+          var frames = decoder.push(chunk);
+          for (var i = 0; i < frames.length; i++) {
+            var parsed = parseBlock(frames[i]);
+            if (parsed) ex.consume(parsed);
+          }
+          emitStream(ex);
+          if (this.readyState === 4 && !done) {
+            /** XHR 也有状态码 —— 记进统一变量（见 lastHttpStatus 的说明）。 */
+            try { lastHttpStatus = this.status; } catch (e) { /* ignore */ }
+            done = true;
+            var rest = decoder.finish();
+            for (var j = 0; j < rest.length; j++) {
+              var p2 = parseBlock(rest[j]);
+              if (p2) ex.consume(p2);
+            }
+          /**
+           * ⭐ 流结束前把**还在缓冲的孤儿文本**落盘。
+           *
+           * 漏了这一步会怎样（本测试抓到的）：孤儿既不进正文也不进思考，
+           * **整段内容凭空消失** —— 比放错位置更糟。
+           */
+          try { ex.flushOrphan(); } catch (e) { /* ignore */ }
+            emitDone(ex, 'xhr-end');
+          }
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  return 'installed';
+})();`;
+		}
+
+		function buildProbeScript() {
+			return `(function () {
+  try {
+    // ---- 1) token：新版网页端把 token 存成 AppKit 包装 JSON {"value":"<token>"} ----
+    function unwrap(raw) {
+      if (typeof raw !== 'string' || raw === '') return '';
+      var s = raw.trim();
+      if (s.charAt(0) === '{') {
+        try {
+          var o = JSON.parse(s);
+          if (o && typeof o.value === 'string') s = o.value;
+        } catch (e) { return ''; }
+      }
+      if (s.length >= 2 && s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') s = s.slice(1, -1);
+      return s;
+    }
+
+    var raw = null;
+    try { raw = localStorage.getItem('userToken'); } catch (e) {}
+    var token = unwrap(raw);
+
+    // ---- 2) userInfo.id：最强的正面证据 ----
+    //
+    // ⚠️ 真实存储形状（实测自 ~/.dsh/webin/auth/default.json）：
+    //     {"value":{"id":"b3a51eb9-..."},"__version":"0"}
+    // id 是**嵌在 value 里**的，不是顶层字段。早期版本只看顶层 parsed.id，
+    // 于是明明登录了却报 hasUserId:false。这里两种形状都认。
+    var userId = '';
+    try {
+      var uiRaw = localStorage.getItem('__appKit_userInfo');
+      if (typeof uiRaw === 'string' && uiRaw !== '') {
+        var ui = JSON.parse(uiRaw);
+        if (ui && typeof ui === 'object') {
+          if (ui.value && typeof ui.value === 'object' && typeof ui.value.id === 'string') {
+            userId = ui.value.id;          // 实际形状
+          } else if (typeof ui.id === 'string') {
+            userId = ui.id;                // 兼容扁平形状
+          }
+        }
+      }
+    } catch (e) {}
+
+    // ---- 3) 负面证据 ----
+    var href = location.href;
+    var onAuthRoute = /\\/(sign_in|sign_up|login|register)/i.test(href);
+
+    var hasLoginForm = false;
+    try {
+      var ph = document.querySelector('input[placeholder*="手机号"], input[placeholder*="phone"], input[type="tel"]');
+      var btns = document.querySelectorAll('button, div[role="button"]');
+      var hasSendCode = false;
+      var hasLoginBtn = false;
+      for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].textContent || '').trim();
+        if (t === '发送验证码' || t === '获取验证码') hasSendCode = true;
+        if (t === '登录' || t === '登 录') hasLoginBtn = true;
+      }
+      hasLoginForm = !!ph || hasSendCode || hasLoginBtn;
+    } catch (e) {}
+
+    var hasPositive = userId !== '' || token !== '';
+    var loggedIn = hasPositive && !onAuthRoute && !hasLoginForm;
+
+    var brands = [];
+    try {
+      brands = (navigator.userAgentData && navigator.userAgentData.brands || []).map(function (b) {
+        return b.brand + '/' + b.version;
+      });
+    } catch (e) {}
+
+    return JSON.stringify({
+      loggedIn: loggedIn,
+      hasUserId: userId !== '',
+      userIdLength: userId.length,
+      tokenLength: token.length,
+      tokenRawLength: typeof raw === 'string' ? raw.length : 0,
+      onAuthRoute: onAuthRoute,
+      hasLoginForm: hasLoginForm,
+      ua: navigator.userAgent,
+      hasElectron: navigator.userAgent.indexOf('Electron') !== -1,
+      webdriver: navigator.webdriver,
+      brands: brands,
+      hookInstalled: !!window.${MARKER},
+      url: href
+    });
+  } catch (e) {
+    return '{}';
+  }
+})();`;
+		}
+
+		function buildSnapshotScript() {
+			return `(function () {
+  try {
+    var ls = {};
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k === null) continue;
+      // 只存可能承载登录态 / 会话的键，避免把无关缓存也搬走
+      if (k === 'userToken' || k.indexOf('userToken') !== -1 ||
+          k.indexOf('appKit') !== -1 || k.indexOf('hif_') !== -1 ||
+          k.indexOf('__appKit') !== -1) {
+        ls[k] = localStorage.getItem(k);
+      }
+    }
+    return JSON.stringify({
+      localStorage: ls,
+      cookie: (function () { try { return document.cookie; } catch (e) { return ''; } })(),
+      url: location.href,
+      at: Date.now()
+    });
+  } catch (e) {
+    return '{}';
+  }
+})();`;
+		}
+
+		function buildDrainScript() {
+			return `(function () {
+  try {
+    var q = window.${EVENT_QUEUE_KEY};
+    if (!q || !q.length) return '[]';
+    window.${EVENT_QUEUE_KEY} = [];
+    return JSON.stringify(q);
+  } catch (e) {
+    return '[]';
+  }
+})();`;
+		}
+
+		function buildScrollScript() {
+			return `(() => {
+    try {
+      var n = 0;
+      /** 主路径：DeepSeek 的虚拟列表容器。 */
+      var scrollers = document.querySelectorAll('[class*="ds-virtual-list"]');
+      for (var i = 0; i < scrollers.length; i++) {
+        var svEl = scrollers[i];
+        var target = svEl.parentElement && String(svEl.parentElement.className || '').indexOf('ds-scroll-area') !== -1
+          ? svEl.parentElement
+          : svEl;
+        if (target.scrollHeight > target.clientHeight) {
+          target.scrollTop = target.scrollHeight;
+          n++;
+        }
+      }
+      /**
+       * 兜底：类名改版时上面的选择器会失效 —— 把所有「又高又可滚」的
+       * 容器也滚到底。限制尺寸，避免动到无关的小滚动区。
+       */
+      var all = document.querySelectorAll('div');
+      for (var j = 0; j < all.length && j < 400; j++) {
+        var d = all[j];
+        if (d.clientHeight > 200 && d.scrollHeight > d.clientHeight + 40) {
+          d.scrollTop = d.scrollHeight;
+          n++;
+        }
+      }
+      return String(n);
+    } catch (e) { return 'err'; }
+  })()`;
+		}
+
+		function buildScrapeScript() {
+			return `(function () {
+  try {
+    /**
+     * 回复容器候选（从最精确到最宽泛）。
+     *
+     * ## ⭐ 前面的来自**真实页面的类名**（不是猜的）
+     *
+     * 从用户会话记录里提取出 DeepSeek 网页版的 「ds-*」 类名体系：
+     *   - 「ds-markdown」       —— 回复正文容器（**最精确的命中**）
+     *   - 「ds-pow-response」   —— 回复包装
+     *   - 「ds-think-content」  —— 思考内容（由 readThink 单独处理）
+     *
+     * 后面几个是**语义/结构兜底** —— 页面改版换掉类名时还能用。
+     * ⚠️ 但要小心：「[class*="markdown"]」 会命中 「ds-markdown-code-copy-button」
+     * 这类子元素，所以精确类名必须排在前面（顺序即优先级）。
+     */
+    var CANDIDATES = [
+      '.ds-markdown',
+      '[data-message-author-role="assistant"]',
+      '[data-role="assistant"]',
+      '.ds-pow-response',
+      '[class*="assistant"]',
+      '[class*="markdown"]'
+    ];
+
+    /** 反引号用 charCode 拼，避免模板字符串里出现裸反引号。 */
+    var BT = String.fromCharCode(96);
+    var FENCE = BT + BT + BT;
+
+    function visible(el) {
+      if (!el) return false;
+      try {
+        if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
+        var s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none';
+      } catch (e) { return false; }
+    }
+
+    /**
+     * 元素是否**存在且不是明确隐藏**（比 visible 宽）。
+     *
+     * ## ⚠️ 挑回复容器要用这个，不能用 visible
+     *
+     * 真实页面上「高度为 0 但内容在」的情况非常多：
+     *   - 代码块收起时 pre 的高度是 0（用户截图里那个展开按钮）
+     *   - 思考区收起时容器高度是 0
+     *   - **正在生成的回复骨架高度可能还是 0**（节点刚插入、还没撑开）
+     *
+     * 用 visible 过滤候选容器的话，最后一种会让「条数」永远不增长
+     * ⇒ 判定「本轮回复还没来」⇒ 卡住。
+     * 用户报的「网页版早就有答案了，DSH 还在等」很可能就是这个。
+     *
+     * 这里只排除**明确不在页面上**的：display:none / visibility:hidden /
+     * aria-hidden=true。高度为 0 一律算存在。
+     */
+    function present(el) {
+      if (!el) return false;
+      try {
+        var s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+        return true;
+      } catch (e) { return true; }
+    }
+
+    /** 该节点是「界面元素」而不是「回复内容」吗。 */
+    function isChrome(el) {
+      var tag = el.tagName;
+      if (tag === 'BUTTON' || tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SVG' ||
+          tag === 'PATH' || tag === 'SELECT' || tag === 'OPTION') return true;
+      try {
+        if (el.getAttribute('role') === 'button') return true;
+        if (el.getAttribute('contenteditable') === 'true') return true;
+        if (el.getAttribute('aria-hidden') === 'true') return true;
+      } catch (e) {}
+      return false;
+    }
+
+    /**
+     * 该节点是**思考容器**吗。
+     *
+     * ## ⚠️ 为什么必须在正文渲染里排除它（测试确认的真实 bug）
+     *
+     * 真实页面里 ds-think-content **嵌套在 ds-markdown 内部**
+     * （思考是回复的一部分，只是折叠显示）。
+     *
+     * 那么递归渲染正文时会**连思考一起读进去** —— 后果是 DSH 的对话里
+     * 思考变成了正文的一部分。而思考由 readThink() 单独提供，
+     * 两者必须分开。
+     *
+     * 所以正文渲染遇到思考容器**直接跳过**（内容交给 readThink）。
+     */
+    function isThinkNode(el) {
+      try {
+        var c = String(el.className || '');
+        if (c.indexOf('think-content') >= 0) return true;
+        if (c.indexOf('thinking') >= 0) return true;
+        if (c.indexOf('reasoning') >= 0) return true;
+        if (el.getAttribute('data-thinking') !== null) return true;
+        if (el.getAttribute('data-reasoning') !== null) return true;
+      } catch (e) {}
+      return false;
+    }
+
+    /**
+     * ## ⭐⭐⭐ 是不是「思考区」的**界面标签**（不是正文）
+     *
+     * ## 为什么要单独抽出来（用户实测：思考又漏进正文了）
+     *
+     * 原来的排除只认「已思考（用时 N 秒）」这一种文案 —— 而**页面改版换了词**。
+     * 用户 2026-10-14 的截图里，被当成正文交出去的是：
+     *
+     *     已完成分析          ← 折叠条（新版文案）
+     *     思考                ← 分组标题（新版文案）
+     *     用户                ← 分析对象标签
+     *
+     * 文案一变，按文案匹配的排除就全失效 —— 这是**依赖页面特征**的固有脆弱点。
+     * 但折叠条/分组标题**必然是很短的独立文本**，所以判据是「短 + 命中已知文案」，
+     * 并把已知文案尽量列全。
+     *
+     * ⚠️ 单独一个「思考」两字最容易误伤正文，所以那种情况要求**整段就等于它**。
+     */
+    function isThinkLabel(txt) {
+      var t = String(txt || '').trim();
+      if (t === '' || t.length >= 60) return false;
+      if (t.indexOf('已思考（用时') !== -1) return true;
+      if (t.indexOf('已完成分析') !== -1) return true;
+      if (t.indexOf('正在分析请求') !== -1) return true;
+      if (t.indexOf('深度思考') !== -1 && t.length < 20) return true;
+      /** 单独成词的标签（整段就等于它）才算，避免误伤正文。 */
+      if (t === '思考' || t === '用户' || t === '分析') return true;
+      return false;
+    }
+
+      /**
+       * 找代码块的语言标记 —— DeepSeek 把标签渲染在 pre **外面**的头部条里，
+       * 所以 code 元素上的 language-xxx class 常常是空的。
+       *
+       * 判据：在 pre 的前置兄弟 / 父容器里找**短文本**（不超过 20 字符、
+       * 不含空白、只由字母数字与 + # . - 组成），那就是语言名（ldw / js / python…）。
+       *
+       * ⚠️ 找不到时返回空串 —— 宁可没有语言标记，也不要猜错：
+       * 猜错会让正文里的普通代码块被误认成工具调用。
+       */
+              function findCodeLang(pre) {
+          try {
+            /** 语言名：短、无空白、字母开头（ldw / js / python / c++ …）。 */
+            var isLang = function (s) {
+              if (!s) return false;
+              var v = String(s).replace(/^[\\s\\n]+|[\\s\\n]+$/g, "");
+              if (v.length === 0 || v.length > 20) return false;
+              if (/[\\s\\n]/.test(v)) return false;
+              return /^[A-Za-z][A-Za-z0-9+#.-]*$/.test(v);
+            };
+            var clean = function (s) {
+              return String(s || "").replace(/^[\\s\\n]+|[\\s\\n]+$/g, "");
+            };
+            /**
+             * ⭐ 向上遍历祖先链（最多 4 层）—— 这是关键。
+             *
+             * 真实结构里语言标签是 pre 的**祖先**的兄弟（标签和 pre 不在
+             * 同一层）：「标签 div」与「包着 pre 的 body div」才是兄弟。
+             * 只查 pre 的直接兄弟会拿不到 ⇒ 输出裸围栏（真实事故）。
+             */
+            var node = pre;
+            for (var lv = 0; lv < 4 && node; lv++) {
+              /** 同一层里，往前找最多 4 个兄弟。 */
+              var sib = node.previousElementSibling;
+              for (var g = 0; g < 4 && sib; g++) {
+                var st = clean(sib.textContent);
+                if (isLang(st)) return st.toLowerCase();
+                /** 兄弟里可能还套了一层（span / code）。 */
+                var inner = sib.querySelector ? sib.querySelector("span, code, i") : null;
+                if (inner) {
+                  var it = clean(inner.textContent);
+                  if (isLang(it)) return it.toLowerCase();
+                }
+                sib = sib.previousElementSibling;
+              }
+              node = node.parentElement;
+            }
+          } catch (e) {}
+          return "";
+        }
+
+    /** 递归渲染成 markdown，重点是**保留代码块围栏**（工具调用靠它）。 */
+    function render(node, forThink) {
+      if (!node) return '';
+      if (node.nodeType === 3) return node.nodeValue || '';
+      if (node.nodeType !== 1) return '';
+      if (isChrome(node)) return '';
+      /**
+       * ⭐ 思考内容交给 readThink 单独读 —— 正文里必须排除。
+       *
+       * forThink 为真时**不跳过** —— 否则 readThink 渲染自己
+       * 找到的思考容器时会得到空串（踩过：改完正文排除后思考读不到了）。
+       */
+      if (!forThink && isThinkNode(node)) return '';
+      /**
+       * ⭐⭐ 「思考区」排除（两层判据，实测类名无关）：
+       *   A) 节点文本含「已思考（用时」且 < 60 字 ⇒ 折叠条标题本身
+       *   B) 节点的**第一个孩子**文本是折叠条 ⇒ 思考块（标题+内容）
+       * 命中任一 ⇒ 排除（render 与 fallback 都走这里）。
+       * 容器（ds-markdown）不排除 —— 它还装正文。
+       */
+      if (!forThink && node.parentElement) {
+        /**
+         * ⭐⭐ 思考区排除 v3（基于「兄弟结构」而非「首孩」）：
+         *
+         * 用户截图的页面结构：折叠条、思考内容、正文是**依次的兄弟**
+         * （都在消息容器里）。排除规则：
+         *   A) 节点自身是折叠条（文本 < 60 且含「已思考（用时」）
+         *   B) 节点的**前一个兄弟**是折叠条 ⇒ 节点是思考 body
+         *
+         * ⚠️ 不能用「首孩是折叠条」判容器 —— 容器的首孩也是折叠条，
+         * 排除容器会把正文一起丢（实测踩过：last 变空）。
+         * ⚠️ previousElementSibling 真实 DOM 有；桩也要有（已加）。
+         */
+        var nt3 = '';
+        try { nt3 = String(node.textContent || ''); } catch (e) { nt3 = ''; }
+        if (isThinkLabel(nt3)) return '';
+        /**
+         * ⭐⭐ 代码块语言标签条排除：节点的**下一个兄弟是 pre**，且自身
+         * 是短语言名 ⇒ 它是语言标签条（DeepSeek 把语言名渲染在 pre 外面）。
+         *
+         * 不排除的话它会作为**独立段落**输出 ⇒ 抓到的内容变成
+         * 「ldw + 换行 + 围栏」，语言名重复一次并污染回复的开头。
+         */
+                var nxt = node.nextElementSibling || null;
+        /**
+         * ⭐ 判据放宽：下一个兄弟是 pre **或含 pre**（真实结构是嵌套的 ——
+         * 标签与「包着 pre 的容器」才是兄弟，不直接相邻于 pre）。
+         */
+        var nxtHasPre = false;
+        try {
+          nxtHasPre = nxt !== null && (
+            String(nxt.tagName || '').toLowerCase() === 'pre' ||
+            (nxt.querySelector ? nxt.querySelector('pre') !== null : false)
+          );
+        } catch (e) {}
+        if (nxtHasPre) {
+          var ntx = String(node.textContent || '').replace(/^[\\s\\n]+|[\\s\\n]+$/g, '');
+          if (
+            ntx.length > 0 &&
+            ntx.length <= 20 &&
+            !/[\\s\\n]/.test(ntx) &&
+            /^[A-Za-z][A-Za-z0-9+#.-]*$/.test(ntx)
+          ) {
+            return '';
+          }
+        }
+        var prev = node.previousElementSibling || null;
+        if (prev) {
+          var pt = '';
+          try { pt = String(prev.textContent || ''); } catch (e) { pt = ''; }
+          if (isThinkLabel(pt)) return '';
+        }
+      }
+
+      var tag = String(node.tagName || '').toLowerCase();
+      if (tag === 'br') return '\\n';
+
+      /** 代码块 —— 最关键的一支。 */
+      if (tag === 'pre') {
+          var codeEl = node.querySelector('code');
+          var raw = ((codeEl || node).textContent || '').replace(/\\n+$/, '');
+          /**
+           * 语言标记必须找全，否则围栏变成裸的三反引号，
+           * DSH 的 FENCE_LANG 匹配失败 ⇒ 工具调用退化成纯文本（真实事故）。
+           *
+           * 来源按可靠性：code.className → pre 自身属性 → 前置兄弟 → 父容器。
+           */
+          var lang = '';
+          try {
+            var m = /language-([\\w+#.-]+)/.exec(codeEl ? String(codeEl.className || '') : '');
+            if (m) lang = m[1];
+          } catch (e) {}
+          if (!lang) {
+            try {
+              var pm = /language-([\\w+#.-]+)/.exec(String(node.className || ''));
+              if (pm) lang = pm[1];
+            } catch (e) {}
+          }
+          if (!lang) {
+            try {
+              var dl = node.getAttribute
+                ? (node.getAttribute('data-language') || node.getAttribute('data-lang'))
+                : '';
+              if (dl) lang = String(dl);
+            } catch (e) {}
+          }
+          if (!lang) lang = findCodeLang(node);
+          return '\\n\\n' + FENCE + lang + '\\n' + raw + '\\n' + FENCE + '\\n\\n';
+        }
+      if (tag === 'code') return BT + (node.textContent || '') + BT;
+
+      var BLOCK = { p: 2, div: 1, li: 1, tr: 1, h1: 2, h2: 2, h3: 2, h4: 2, h5: 2, h6: 2,
+        blockquote: 2, table: 2, ul: 1, ol: 1, hr: 2 };
+      var isBlock = Object.prototype.hasOwnProperty.call(BLOCK, tag);
+
+      var out = tag === 'li' ? '- ' : '';
+      var kids = node.childNodes || [];
+      for (var i = 0; i < kids.length; i++) out += render(kids[i], forThink);
+
+      if (isBlock) {
+        out = out.replace(/[ \\t]+$/, '');
+        out += BLOCK[tag] >= 2 ? '\\n\\n' : '\\n';
+      }
+      return out;
+    }
+
+    function tidy(s) {
+      return String(s || '').replace(/\\n{3,}/g, '\\n\\n').replace(/^[\\s\\n]+|[\\s\\n]+$/g, '');
+    }
+
+    /**
+     * 读思考过程。
+     *
+     * ## 为什么单独处理
+     *
+     * 网页版的思考（「已思考（用时 N 秒）」）是**可折叠**区域，
+     * 默认收起。用户明确要求过要看到思考，所以：
+     *   - 先找思考容器（按文字特征 + 结构特征）
+     *   - 收起状态下 textContent 仍能读到（DOM 里内容在，只是被 CSS 隐藏）
+     *     所以**不受折叠影响** —— 这正是 DOM 抓取比 SSE 省事的地方
+     *
+     * ⚠️ 找不到就返回空串，**不能让整条回复失败**。
+     */
+    function readThink() {
+      /**
+       * 思考容器的候选选择器。
+       *
+       * ## ⭐ 前两个来自**真实页面的类名**（不是猜的）
+       *
+       * 从用户会话记录里提取出 DeepSeek 网页版的 「ds-*」 类名体系，其中：
+       *   - 「ds-think-content」  —— 思考内容容器（精确命中）
+       *   - 「ds-markdown」       —— 回复正文容器
+       *   - 「ds-pow-response」   —— 回复包装
+       *   - 「ds-markdown-code-copy-button」 —— 代码块上的复制按钮（界面元素，要剔除）
+       *
+       * 所以优先用 「ds-think-content」（精确），后面几个是页面改版时的兜底。
+       */
+      /**
+       * ⭐ 优先用「已思考」折叠条定位（类名无关，UI 文案稳定）。
+       *
+       * 标题条：含「已思考」且无更深含「已思考」的子节点。
+       * 思考内容 = 标题条的**下一个兄弟**（展开时是缩进块）；
+       * 找不到兄弟就用父级文本（排除标题条自身）。
+       */
+      try {
+        var els2 = document.querySelectorAll('*');
+        for (var wi = els2.length - 1; wi >= 0; wi--) {
+          var wt = '';
+          try { wt = String(els2[wi].textContent || ''); } catch (e) { wt = ''; }
+          /**
+           * ⚠️ 这里原来硬匹配「已思考」—— 而页面已改文案为「已完成分析」，
+           * 匹配不上 ⇒ readThink 返回空 ⇒ 思考混进正文时**无东西可剔除**
+           * （用户实测：思考又被当正文交付）。
+           * 改用与 render 排除同源的 isThinkLabel()，两处判据不再分叉。
+           */
+          if (!isThinkLabel(wt)) continue;
+          var wkk = els2[wi].children || [];
+          var wdeeper = false;
+          for (var wj = 0; wj < wkk.length; wj++) {
+            if (isThinkLabel(String(wkk[wj].textContent || ''))) { wdeeper = true; break; }
+          }
+          if (wdeeper) continue;
+          /** 找到标题条。思考 = 它父级里除标题条外文本最长的兄弟。 */
+          var best2 = null, bestLen2 = 0;
+          var sibs2 = els2[wi].parentElement ? (els2[wi].parentElement.children || []) : [];
+          for (var si2 = 0; si2 < sibs2.length; si2++) {
+            if (sibs2[si2] === els2[wi]) continue;
+            var st2 = '';
+            try { st2 = String(sibs2[si2].textContent || ''); } catch (e) { st2 = ''; }
+            if (st2.length > bestLen2) { bestLen2 = st2.length; best2 = sibs2[si2]; }
+          }
+          if (best2 && bestLen2 > 10) return tidy(render(best2, true));
+          /** 没有兄弟（思考收起）—— 退回普通选择器路径。 */
+          break;
+        }
+      } catch (e) { /* 降级到 SEL 路径 */ }
+
+      var SEL = [
+        '.ds-think-content',
+        '[class*="think-content"]',
+        '[class*="thinking"]',
+        '[class*="reasoning"]',
+        '[class*="think"]',
+        '[data-thinking]',
+        '[data-reasoning]'
+      ];
+      var found = null;
+      for (var i = 0; i < SEL.length && !found; i++) {
+        var list;
+        try { list = document.querySelectorAll(SEL[i]); } catch (e) { continue; }
+        /** 取**最后一个**（最新一轮的思考）。可见性不作硬要求 —— */
+        /** 折叠时容器可能高度为 0，但内容仍在 DOM 里。 */
+        for (var j = list.length - 1; j >= 0; j--) {
+          found = list[j];
+          break;
+        }
+      }
+      if (!found) return '';
+      var t = tidy(render(found, true));
+      /**
+       * 去掉「已思考（用时 N 秒）」这类标题行 —— 它是界面文字，
+       * 不是思考内容本身。
+       */
+      /**
+       * â ï¸ åæ¥åªæ¸ãå·²æèï¼ç¨æ¶ N ç§ï¼ãââ é¡µé¢æ¹ææ¡åæ¸ä¸æã
+       * ç°å¨æå·²ç¥ææ¡é½åä¸ï¼ä¸ isThinkLabel åæºï¼ã
+       */
+      t = t.replace(/^(å·²æè|å·²å®æåæ|æ­£å¨åæè¯·æ±|æ·±åº¦æè|æè)[ï¼(]?[^\\n]{0,20}[)ï¼]?\\s*/i, '');
+      /**
+       * â­ åéè¡å»ææ´è¡å°±æ¯æ ç­¾çè¡ã
+       *
+       * å®æµé¡µé¢ä¼æãæè Â· ç¨æ·ãè¿ç§åç»æ é¢æè¿æèæ­£æã
+       * å®ä»¬æ¯çé¢æå­ï¼ä¸å±äºæèåå®¹ã
+       */
+      t = t
+        .split(String.fromCharCode(10))
+        .filter(function (line) {
+          var s = line.trim();
+          if (s === '') return true;
+          /** ãæè Â· ç¨æ·ãï¼ç¨åéç¬¦æå¼ï¼æ¯æ®µé½æ¯æ ç­¾ â æ´è¡æ¯æ ç­¾ã */
+          var segs = s.split(/[Â·|\\/]+/).map(function (x) { return x.trim(); }).filter(function (x) { return x !== ''; });
+          if (segs.length > 0 && segs.every(function (x) { return isThinkLabel(x); })) return false;
+          return !isThinkLabel(s);
+        })
+        .join(String.fromCharCode(10));
+      t = t.replace(/^思考过程\\s*/i, '');
+      return tidy(t);
+    }
+
+    /**
+     * ## ⭐⭐ 排除「非回复区」—— 端到端实测抓到的真 bug
+     *
+     * ## 现场（「node scripts/e2e-echo.mjs」 的真实输出）
+     *
+     * 问「1+1=?只回答数字」，抓回来 1256 字符，内容是：
+     *
+     *     开启新对话
+     *     置顶
+     *     低光增强Prompt模块设计与实现
+     *     REN模块去雨Prompt模块架构设计
+     *     今天
+     *     1加1等于2
+     *     在不在
+     *     技能调用确认
+     *     昨天
+     *
+     * —— 这是**侧边栏的会话列表**，不是回复正文！
+     *
+     * ## 为什么会这样
+     *
+     * 候选全都没命中时走 「longest-div」 兜底：取**全页最长的 div 文本**。
+     * 而侧边栏把**所有历史会话标题**堆在一起，文本长度很容易超过
+     * 一条回复 ⇒ 兜底抓走了侧边栏。
+     *
+     * 后果正是用户报的「网页版早就输出完了，DSH 就是不输出」——
+     * 抓到的内容和回复无关，所以「内容变了吗」的判据要么一直不变
+     * （卡住），要么一变就交了一堆垃圾。
+     *
+     * ## 判据
+     *
+     * 侧边栏/导航区有稳定的语义标记，**按语义排除**而不是按位置猜：
+     *   - 「<aside>」 / 「<nav>」 标签（语义化布局）
+     *   - 「role="navigation"」 / 「role="complementary"」
+     *   - class/id 里含 sidebar / sider / nav / menu / drawer / history
+     *
+     * ⚠️ 只排除**祖先**是这些区域的元素 —— 不能因为元素自身 class 里
+     * 有个 "nav" 就排除（回复正文里可能有 「nav」 这个词的类名）。
+     */
+    function inChrome(el) {
+      if (!el) return false;
+      var node = el;
+      /** 往上找 8 层 —— 再深就不可能是侧边栏了。 */
+      for (var d = 0; d < 8 && node; d++) {
+        var tag = String(node.tagName || '').toLowerCase();
+        if (tag === 'aside' || tag === 'nav') return true;
+        var role = node.getAttribute ? String(node.getAttribute('role') || '') : '';
+        if (role === 'navigation' || role === 'complementary' || role === 'banner') return true;
+        var cls = '';
+        try { cls = String(node.className || ''); } catch (e) { cls = ''; }
+        var id = node.getAttribute ? String(node.getAttribute('id') || '') : '';
+        var mark = (cls + ' ' + id).toLowerCase();
+        /**
+         * ⚠️ 用**词边界**匹配，避免误伤 —— 例如正文里可能有
+         * 「ds-markdown」 这种含 "mark" 的类名（不在列表里，但同理）。
+         */
+        if (/(^|[^a-z])(sidebar|sider|drawer|side-nav|sidenav|nav-list|navlist|menu-list|history-list|conversation-list|session-list)([^a-z]|$)/.test(mark)) {
+          return true;
+        }
+        node = node.parentElement;
+      }
+      return false;
+    }
+
+    /**
+     * ## ⭐ 主内容区（优先在它里面找回复）
+     *
+     * 排除法（「inChrome」）能挡住侧边栏，但如果页面结构变了、
+     * 侧边栏换了标记，还是会漏。
+     *
+     * 所以再加一层**正向**判据：先找 「<main>」（或 「role="main"」），
+     * 在它**里面**找回复 —— 侧边栏天然不在 main 里。
+     *
+     * 找不到 main 就退回 「document.body」（那时只能靠 inChrome 排除）。
+     */
+    function mainRoot() {
+      try {
+        var m = document.querySelector('main, [role="main"]');
+        if (m) return m;
+      } catch (e) { /* 忽略 */ }
+      /**
+       * ⚠️ body 可能为 null，而且**必须确认它有 querySelectorAll** ——
+       * 直接返回它会让调用方抛
+       * "root.querySelectorAll is not a function"（实测踩过）。
+       */
+      var b = document.body;
+      if (b && typeof b.querySelectorAll === 'function') return b;
+      return document;
+    }
+
+    /**
+     * ## ⭐⭐⭐ 抓取前把消息列表滚到底（虚拟列表适配）
+     *
+     * ## 根因（vlist 诊断给出的决定性证据）
+     *
+     *     ds-virtual-list-items          h=1680  ← 消息总高度（有内容）
+     *     ds-virtual-list-visible-items  kids=0 h=0  ← 但可见区是空的
+     *
+     * DeepSeek 用**虚拟滚动**：只把「视口内」的消息插进 DOM。
+     * 新回复在列表**底部**，视口若停在别处，最新回复就**不在 DOM 里**
+     * —— 这就是「网页版早就有答案了，DSH 抓不到」的最终根因。
+     *
+     * 修法：抓取前把虚拟列表的滚动容器滚到底，强制渲染最新消息。
+     * 改滚动位置**不改页面内容**，无副作用（用户看回复本来就在底部）。
+     */
+    /**
+     * ⚠️⚠️ 滚动已**移出**抓取脚本 —— 改由 client 分两步调用
+     * （见 {@link buildScrollScript}）。
+     *
+     * ## 为什么必须拆开（真实事故：交付了侧边栏）
+     *
+     * 原先在这里「同步滚到底 → 立刻抓」，但**虚拟列表的重渲染是异步的**：
+     * 设置 scrollTop 只是**触发**滚动，DeepSeek 要等下一帧才把
+     * 「视口内的消息」插进 DOM。
+     *
+     * 本脚本是一次 eval 同步跑完 ⇒ 新消息**还没进 DOM** ⇒ 精确候选
+     * 全部 found=0 ⇒ 掉到 longest-div 兜底 ⇒ 抓到**侧边栏**
+     * （1110 字符的会话列表）当回复交付。
+     *
+     * 用户实测症状：DSH 收到的回复是
+     * 「开启新对话 / 置顶 / 今天 / 新对话…」，而网页版明明答对了。
+     *
+     * ⇒ client 侧：buildScrollScript → 等 2~3 帧 → buildScrapeScript。
+     */
+
+    /**
+     * ## ⭐⭐⭐ 页面是否**仍在生成**（停止按钮存在）
+     *
+     * ## ⚠️ 旧判据是错的，而且错了很久（本轮实测发现）
+     *
+     * 旧写法只找 aria-label / title 含「停止 / stop」的元素。但**本文件里
+     * buildStopScript 的注释早就写明了**：「DeepSeek 的停止键是**纯图标
+     * （无 aria-label、无文字）**，只能靠 class 特征区分」。
+     *
+     * 两处判据自相矛盾，而错的是这一处 ⇒ isGenerating() **恒返回 false** ⇒
+     *   - 「生成中不交付」那道闸门**从来没生效过**
+     *   - 依赖它的判据（如「页面在生成就不算没发出去」）也全部失效
+     *
+     * 实测证据：v0.2.5 加了 generating 一票否决后，用户仍然在网页版生成中
+     * 收到「消息似乎没有发出去」—— 因为 generating 压根不是 true。
+     *
+     * ## 现在的判据：用**已校准的 class 特征**（与 buildStopScript 同源）
+     *
+     *   - 发送键独有：ds-button--filled / ds-button--primary ⇒ 排除
+     *   - 停止键独有：ds-button--outlined ⇒ 命中即判定生成中
+     *   - 语义兜底：页面改版后若补上 aria-label，也认
+     *
+     * 仍然保持「找不到就返回 false（不阻止交付，宁早勿卡）」的取舍。
+     *
+     * ⚠️ 本注释在模板字符串里，**不能出现反引号** —— 会提前终止模板
+     * （这个坑本轮踩了四次，已加审计防它）。
+     */
+    function labelOfEl(el) {
+      var parts = [];
+      try {
+        if (el.getAttribute) {
+          parts.push(el.getAttribute('aria-label') || '');
+          parts.push(el.getAttribute('title') || '');
+          parts.push(el.getAttribute('data-testid') || '');
+        }
+        if (el.className && typeof el.className === 'string') parts.push(el.className);
+        var t = (el.textContent || '').trim();
+        if (t.length <= 24) parts.push(t);
+      } catch (e) {}
+      return parts.join(' ').toLowerCase();
+    }
+
+    function isGenerating() {
+      try {
+        var all = document.querySelectorAll('button, [role="button"]');
+        for (var gi = 0; gi < all.length; gi++) {
+          var st = all[gi];
+          if (!st.offsetWidth && !st.offsetHeight) continue;
+          var L = labelOfEl(st);
+          /** 发送键独有 ⇒ 明确排除（生成中它**不会消失**）。 */
+          if (/ds-button--filled|ds-button--primary/.test(L)) continue;
+          /** 停止键独有 ⇒ 命中即判定生成中。 */
+          if (/ds-button--outlined/.test(L)) return true;
+          /** 语义兜底（页面改版后可能补上 aria-label）。 */
+          if (/stop|停止|中断|abort/.test(L)) return true;
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    var list = [];
+    var usedSelector = '';
+    var root = mainRoot();
+    /**
+     * ## ⭐ 决策轨迹 —— 每个候选为什么被选中/跳过
+     *
+     * ## 为什么加（用户：「不要猜」）
+     *
+     * 抓到侧边栏时，我**看不到**内部判断过程：是 「.ds-markdown」 没匹配上？
+     * 还是匹配上了但被 present/inChrome 过滤？还是长度不够？
+     *
+     * 有了轨迹，一次调用就能看出卡在哪 —— 不用改代码、重启、再看。
+     */
+    var trace = [];
+    for (var c = 0; c < CANDIDATES.length; c++) {
+      var found;
+      /**
+       * ⚠️ 在**主内容区**里查，而不是全文档 —— 这一条就能挡掉侧边栏。
+       * 万一 main 里没有（有些布局不用 main），再用全文档兜一次。
+       */
+      try { found = root.querySelectorAll(CANDIDATES[c]); } catch (e) { continue; }
+      if (found.length === 0 && root !== document.body) {
+        try { found = document.querySelectorAll(CANDIDATES[c]); } catch (e) { continue; }
+      }
+      /** 记录：命中几个节点。 */
+      var skipped = { present: 0, chrome: 0, short: 0 };
+      /**
+       * ⭐ 这个候选是不是**精确类名**（.ds-markdown 这类）。
+       *
+       * ## ⚠️⚠️ 精确候选**不能**做长度过滤（这是「一直等」的真正根因）
+       *
+       * ## 现场（端到端探针的原始输出）
+       *
+       *     root=MAIN  cand=1  present=true  inChrome=false
+       *     len=1  txt=5          ← 回复正文就是「5」
+       *     ...但 count=0         ← 被长度过滤拒了
+       *
+       * 用户问「1+1=?只回答数字」，DeepSeek 答「2」—— **一个字符**。
+       * 而这里原来要求 「t.length >= 8」，于是：
+       *
+       *   1. 精确候选 「.ds-markdown」 命中，但内容太短 ⇒ **被丢弃**
+       *   2. 「picked」 为空 ⇒ 换下一个候选
+       *   3. 所有候选都被拒 ⇒ 「list」 为空
+       *   4. 落到 「longest-div」 兜底 ⇒ 抓走**侧边栏的会话列表**
+       *      （长、稳定、永远不变）
+       *   5. 「内容变了吗」的判据永远不成立 ⇒
+       *      **DSH 一直等，而网页版早就答完了**
+       *
+       * 这正是用户反复报的那句话：
+       *   「网页版早就输出完了，dsh 窗口还是深度求索中」
+       *
+       * ## 修法：精确候选不做长度过滤
+       *
+       * 「.ds-markdown」 是**真实页面的类名**（从用户会话记录里提取的），
+       * 它命中就是回复正文 —— 内容再短也是回复。
+       * 长度过滤只对**模糊候选**（「[class*="markdown"]」 这种）保留，
+       * 因为那些可能命中按钮/标签之类的小元素。
+       */
+      var precise = CANDIDATES[c].charAt(0) === '.' && CANDIDATES[c].indexOf('*') === -1;
+      var picked = [];
+      for (var i = 0; i < found.length; i++) {
+        /**
+         * 用 present 而不是 visible —— 正在生成的回复骨架高度可能是 0，
+         * 但它确实是本轮的新回复。见 present 的说明。
+         */
+        if (!present(found[i])) { skipped.present++; continue; }
+        /** ⭐ 排除侧边栏/导航区（端到端实测抓到的 bug）。 */
+        if (inChrome(found[i])) { skipped.chrome++; continue; }
+        var t = tidy(render(found[i]));
+        /**
+         * ⚠️ 精确候选：**只要非空就收**（回复可能只有一个字）。
+         * 模糊候选：仍然要求 >= 8，避免收进按钮文字之类的碎片。
+         */
+        if (precise ? t.length > 0 : t.length >= 8) picked.push(t);
+        else skipped.short++;
+      }
+      trace.push({
+        sel: CANDIDATES[c],
+        found: found.length,
+        picked: picked.length,
+        precise: precise,
+        skipped: skipped.present + "/" + skipped.chrome + "/" + skipped.short
+      });
+      if (picked.length > 0) { list = picked; usedSelector = CANDIDATES[c]; break; }
+    }
+
+    /**
+     * 最后手段：主内容区里最长的 div。
+     *
+     * ⚠️ 原来扫的是 「document.querySelectorAll('div')」（**全页**），
+     * 于是侧边栏的会话列表经常胜出 —— 端到端实测就是这么抓到
+     * 「开启新对话 / 置顶 / 昨天」的。现在**只在主内容区里扫**，
+     * 并且仍然过一遍 inChrome。
+     */
+    /**
+     * ⭐⭐⭐ 侧边栏否决器 —— 兜底抓到会话列表时**宁可返回空**。
+     *
+     * ## 真实事故（用户实测「绝望了」）
+     *
+     * 所有精确候选 found=0 ⇒ 掉到 longest-div 兜底 ⇒ 抓到**侧边栏**
+     * （1110 字符的会话列表：「开启新对话 / 置顶 / 今天 / 新对话…」）
+     * 当回复交付。网页版明明答对了（「写好了：小故事.txt」），
+     * DSH 收到的却是会话列表。
+     *
+     * ## 判据（特征组合，不是单一关键词）
+     *
+     *   - 含「开启新对话」或独立成行的「新对话」（新建按钮 / 列表项）
+     *   - 含日期分组标题（「今天」「昨天」「7 天内」）
+     *   - 且**不含**代码块围栏（回复几乎总带围栏或长段落）
+     *   - 且长度 > 60（太短不至于判错）
+     *
+     * ⚠️ 宁可返回空（⇒ client 继续等）也不交侧边栏 ——
+     * 交错比等待更糟（用户会以为模型答非所问）。
+     */
+    function looksLikeSidebar(txt) {
+      if (!txt) return false;
+      var s = String(txt);
+      /** 有代码围栏 ⇒ 是回复（围栏用字符码拼，避免模板字符串冲突）。 */
+      var fence = String.fromCharCode(96, 96, 96);
+      if (s.indexOf(fence) !== -1) return false;
+      var hasNewChat = s.indexOf('开启新对话') !== -1 || (s.indexOf(String.fromCharCode(10) + '新对话') !== -1);
+      var hasDateGroup = s.indexOf('今天') !== -1 || s.indexOf('昨天') !== -1 || s.indexOf('7 天内') !== -1;
+      return hasNewChat && hasDateGroup && s.length > 24;
+    }
+
+    /**
+     * ## ⭐⭐⭐ 回复是否**停在未闭合的代码围栏里**（= 还没写完）
+     *
+     * ## 为什么必须判它（真实事故）
+     *
+     * 服务端中途掐断生成时，**整段都在围栏里**的内容会被截在半句。实测交付过
+     * 这样的「回复」：
+     *
+     *     ldw
+     *
+     *     const r = await write(
+     *
+     * DSH 侧解析不出工具调用，用户看到的是「已完成」+ 一句残缺代码 ——
+     * 而真正的原因是服务端把生成停了，用户根本无从得知。
+     *
+     * 判据极简且可靠：围栏标记（三个反引号）计数为**奇数** ⇒ 一定没写完。
+     * 正常结束的回复围栏总是成对闭合的。
+     *
+     * ⚠️ 围栏用字符码拼 —— 本函数整体位于模板字符串里，直接写三反引号会
+     * 提前终止模板（本文件里已有的同类写法见 looksLikeSidebar）。
+     */
+    function isFenceOpen(txt) {
+      if (!txt) return false;
+      var fence = String.fromCharCode(96, 96, 96);
+      var s = String(txt);
+      var n = 0;
+      var i = 0;
+      while (true) {
+        var k = s.indexOf(fence, i);
+        if (k === -1) break;
+        n++;
+        i = k + fence.length;
+      }
+      return n % 2 === 1;
+    }
+
+    /**
+     * ## ⭐⭐⭐ 最后一个代码块的正文是否**明显没写完**
+     *
+     * ## 为什么不能只看围栏闭合（实测踩到）
+     *
+     * 网页版的 markdown 渲染器会给**未闭合的围栏自动补上闭合** —— 所以从
+     * 渲染后的 DOM 里读出来的文本，围栏**永远是成对的**。
+     *
+     * 实测：页面显示的是半截工具调用（以左花括号结尾），而 DOM 里读到的文本
+     * 围栏已经闭合（渲染器补的）。于是 isFenceOpen 判为「完整」，闸门不触发，
+     * 半截工具调用照样交付。
+     *
+     * ## 判据：代码块正文以**不可能自然收尾**的 token 结尾
+     *
+     * 代码写完了必然以标识符 / 闭括号 / 分号 / 字符串结尾。以这些结尾 ⇒ 没写完：
+     * 左花括号、左圆括号、左方括号、逗号、箭头、逻辑与、逻辑或、
+     * 点号、等号、冒号、加减乘除、尖括号。
+     *
+     * ⚠️ **只在代码块内部判** —— 普通正文里以冒号、加号结尾都很常见
+     * （「步骤如下：」），拿它判会大量误报。
+     *
+     * ⚠️ 本注释也在模板字符串里，**不能出现反引号** —— 那会提前终止模板
+     * （本文件已被这个坑坑过一次）。所以上面的 token 只用中文描述。
+     */
+    function lastCodeBlockIncomplete(txt) {
+      if (!txt) return false;
+      var fence = String.fromCharCode(96, 96, 96);
+      var s = String(txt);
+      /** 取最后一个闭合代码块的正文。 */
+      var lastOpen = -1;
+      var i = 0;
+      var prevOpen = -1;
+      while (true) {
+        var k = s.indexOf(fence, i);
+        if (k === -1) break;
+        if (prevOpen === -1) prevOpen = k;
+        else { lastOpen = prevOpen; prevOpen = -1; }
+        i = k + fence.length;
+      }
+      if (lastOpen === -1) return false;
+      /** 正文 = 首个换行之后到下一个围栏之前（跳过语言标记那行）。 */
+      var afterFence = s.indexOf(String.fromCharCode(10), lastOpen);
+      if (afterFence === -1) return false;
+      var close = s.indexOf(fence, afterFence);
+      var body = close === -1 ? s.slice(afterFence) : s.slice(afterFence, close);
+      body = body.replace(/[ \\t\\r\\n]+$/, '');
+      if (body.length === 0) return false;
+      var tail = body.slice(-2);
+      var one = body.slice(-1);
+      /** 两字符的收尾 token 先判（否则箭头会被当成单个大于号）。 */
+      if (tail === '=>' || tail === '&&' || tail === '||') return true;
+      /**
+       * ⚠️ 收尾 token 表用 **String.fromCharCode 拼**，源码里不出现字面括号。
+       *
+       * 两个原因，都是实测踩到的：
+       *
+       *   1. 本函数位于模板字符串内，而多个测试脚本用「朴素花括号配对」从产物里
+       *      抠它 —— 源码里出现不平衡的字面括号会把配对带偏（实测：
+       *      verify-lang / verify-scrape / verify-tool-e2e 直接崩在「括号不配对」）。
+       *   2. 用反斜杠-u 这类转义**没用** —— 打包器会把模板里的转义归一化成
+       *      字面字符，产物里照样出现括号（实测确认）。
+       *
+       * 123=左花括号 40=左圆括号 91=左方括号；其余为逗号 点号 冒号 等号
+       * 加 减 乘 除 小于 大于。
+       */
+      var TAIL_TOKENS = String.fromCharCode(123, 40, 91) + ',.:=+-*/<>';
+      if (TAIL_TOKENS.indexOf(one) !== -1) return true;
+      return false;
+    }
+
+    /**
+     * ## ⭐⭐⭐ 读页面上的**服务端错误提示**（「服务器暂时不可用」等）
+     *
+     * ## 为什么需要
+     *
+     * 服务端不可用 / 限流时，网页版会插一条提示，并**直接掐断生成**。此时若
+     * 照常交付，用户看到的是「已完成」+ 半截内容，完全不知道真实原因是服务端
+     * 拒绝 —— 也就不会想到重试。
+     *
+     * 检测到就上报：client 负责**提醒用户 + 按策略重试**。
+     *
+     * ## 实现取舍
+     *
+     * 不知道横幅的类名（页面改版会变），所以只能扫文本。为了不拖慢轮询：
+     *   - 只看**叶子节点**（有子元素的节点文本必然包含子节点的文本，白扫）
+     *   - 文本长度限制 60 以内（横幅是一句话，不会更长）
+     *   - 节点数封顶 4000（真页面上千节点，超出部分几乎不可能是横幅）
+     */
+    function readServerError() {
+      var KEYS = [
+        '服务器暂时不可用', '服务暂时不可用', '服务器繁忙', '服务繁忙',
+        '请求过于频繁', '网络异常', '系统繁忙', '请稍后重试',
+        'Server is busy', 'Service Unavailable', 'Too Many Requests'
+      ];
+      try {
+        var nodes = document.querySelectorAll('div, span, p, section');
+        var cap = Math.min(nodes.length, 4000);
+        for (var i = 0; i < cap; i++) {
+          var el = nodes[i];
+          /** 只看叶子：父节点的 textContent 包含子节点文本，扫了也是白扫。 */
+          if (el.firstElementChild) continue;
+          if (!el.offsetWidth && !el.offsetHeight) continue;
+          var t = (el.textContent || '').trim();
+          if (t.length === 0 || t.length > 60) continue;
+          for (var k = 0; k < KEYS.length; k++) {
+            if (t.indexOf(KEYS[k]) !== -1) return KEYS[k];
+          }
+        }
+      } catch (e) {}
+      return '';
+    }
+
+    if (list.length === 0) {
+      var fallbackInfo = "";
+      var all = root.querySelectorAll('div');
+      var best = '';
+      var excluded = [];
+      for (var k = 0; k < all.length; k++) {
+        if (!present(all[k])) continue;
+        if (inChrome(all[k])) continue;
+        var txt = tidy(render(all[k]));
+        if (txt === '') {
+          /**
+           * ⭐ render 排除了它（思考块等）—— 记下子树，
+           * 后面不再扫它的孩子（否则思考 body 这个子 div 会被抓）。
+           */
+          excluded.push(all[k]);
+          continue;
+        }
+        var under = false;
+        for (var ei = 0; ei < excluded.length; ei++) {
+          try { if (excluded[ei].contains(all[k])) { under = true; break; } } catch (e) {}
+        }
+        if (under) continue;
+        if (txt.length > best.length) best = txt;
+      }
+      /**
+       * ⭐ 侧边栏否决：兜底结果像会话列表 ⇒ **丢弃**（返回空让 client 继续等）。
+       */
+      if (looksLikeSidebar(best)) {
+        fallbackInfo = "divs=" + all.length + " bestLen=" + best.length + " REJECTED=sidebar";
+        best = '';
+      } else {
+        fallbackInfo = "divs=" + all.length + " bestLen=" + best.length;
+      }
+      if (best.length >= 8) { list = [best]; usedSelector = 'longest-div'; }
+    }
+
+    return JSON.stringify({
+      ok: list.length > 0,
+      /** ⭐⭐ 页面是否仍在生成（停止按钮存在）—— 交付判据用它防「思考被当回复」。 */
+      generating: isGenerating(),
+      /**
+       * ⭐ 回复是否停在未闭合围栏里（= 没写完）。交付闸门用它挡住半截工具调用。
+       */
+      fenceOpen: isFenceOpen(list.length > 0 ? list[list.length - 1] : ''),
+      /**
+       * ⭐ 代码块正文是否明显没写完 —— 围栏被渲染器补过闭合时，这条才是
+       * 唯一能发现截断的信号（见 lastCodeBlockIncomplete 的说明）。
+       */
+      codeTrailingIncomplete: lastCodeBlockIncomplete(list.length > 0 ? list[list.length - 1] : ''),
+      /**
+       * ⭐ 页面上的服务端错误提示（空串 = 没有）。非空 ⇒ 生成是被服务端掐断的，
+       * 必须提醒用户并重试，而不是把半截内容当成功交付。
+       */
+      serverError: readServerError(),
+      /** 全部候选；**最后一条**是最新一轮的回复。 */
+      all: list,
+      last: list.length > 0 ? list[list.length - 1] : '',
+      /** 思考过程（读不到就是空串，不影响回复）。 */
+      think: readThink(),
+      selector: usedSelector,
+      count: list.length,
+      url: location.href,
+      /** 诊断：主内容区是从哪找到的（排查抓错区时看这个）。 */
+      root: root === document.body ? 'body' : String(root.tagName || '').toLowerCase()
+,
+      trace: trace,
+      fallback: fallbackInfo
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, last: '', all: [], error: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildFillScript(text, hints) {
+			const inputSelectors = hints?.inputSelectors ?? [
+				"textarea[placeholder*=\"给 DeepSeek\"]",
+				"textarea[placeholder*=\"DeepSeek\"]",
+				"textarea[placeholder*=\"输入\"]",
+				"textarea",
+				"div[contenteditable=\"true\"]",
+				"[role=\"textbox\"]"
+			];
+			return `(function () {
+  var TEXT = ${JSON.stringify(text)};
+  var INPUT_SELECTORS = ${JSON.stringify(inputSelectors)};
+
+  function visible(el) {
+    if (!el) return false;
+    try {
+      if (el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+      var r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return true;
+      var s = window.getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    } catch (e) { return false; }
+  }
+
+  function disabled(el) {
+    if (!el) return true;
+    try {
+      if (el.disabled === true) return true;
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  /** 只读的输入框填不进去 —— 及早排除。 */
+  function readOnly(el) {
+    try {
+      if (el.readOnly === true) return true;
+      if (el.getAttribute && el.getAttribute('aria-readonly') === 'true') return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  /** 把 CRLF 折成 LF（textarea 的 value 会做这个规范化，见 toLf 的说明）。 */
+  function toLf(s) {
+    return String(s).replace(/\\r\\n?/g, '\\n').replace(/\\n\\r/g, '\\n');
+  }
+
+  function readInput(el) {
+    try {
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') return el.value || '';
+      return el.innerText || el.textContent || '';
+    } catch (e) { return ''; }
+  }
+
+  /** 填入。判据是「非空」而不是「逐字节全等」—— 见原 setText 的说明。 */
+  function setText(el, value) {
+    el.focus();
+    value = toLf(value);
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+      var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(el, value);
+      else el.value = value;
+      try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+      try {
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: false, inputType: 'insertText', data: value }));
+      } catch (e) {}
+      return readInput(el) === '' ? { ok: false, how: 'native-setter-noop' } : { ok: true, how: 'native-setter' };
+    }
+    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+      /**
+       * contenteditable：**cuckoo 的做法**（chat-input.ts:59-81）——
+       * 先 selectAll + delete 清空，再**分段 paste**（每段 <=6000 字符）。
+       *
+       * 为什么分段：一次性塞很长的文本会被某些站点识别成附件粘贴。
+       * 这里保持 cuckoo 的阈值与做法。
+       */
+      el.focus();
+      try {
+        document.execCommand('selectAll', false, undefined);
+        document.execCommand('delete', false, undefined);
+      } catch (e) {}
+      try {
+        var CHUNK = 6000;
+        for (var i = 0; i < value.length; i += CHUNK) {
+          var dt = new DataTransfer();
+          dt.setData('text/plain', value.slice(i, i + CHUNK));
+          el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+        }
+        if (readInput(el).trim().length > 0) return { ok: true, how: 'paste-event' };
+      } catch (e) {}
+      try {
+        if (document.execCommand('insertText', false, value)) return { ok: true, how: 'execCommand-insertText' };
+      } catch (e) {}
+      el.textContent = value;
+      try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      return readInput(el).trim() === '' ? { ok: false, how: 'textContent-noop' } : { ok: true, how: 'textContent-fallback' };
+    }
+    return { ok: false, how: 'unsupported-element' };
+  }
+
+  try {
+    /** 收集候选（依次试，见原实现的说明）。 */
+    var cands = [];
+    var seen = [];
+    for (var i = 0; i < INPUT_SELECTORS.length; i++) {
+      var list;
+      try { list = document.querySelectorAll(INPUT_SELECTORS[i]); } catch (e) { continue; }
+      for (var j = 0; j < list.length; j++) {
+        var el = list[j];
+        if (!visible(el) || disabled(el) || readOnly(el)) continue;
+        var dup = false;
+        for (var k = 0; k < seen.length; k++) if (seen[k] === el) { dup = true; break; }
+        if (dup) continue;
+        seen.push(el);
+        cands.push({ el: el, how: INPUT_SELECTORS[i] });
+      }
+    }
+
+    if (cands.length === 0) {
+      return JSON.stringify({
+        ok: false, stage: 'no-input',
+        message: '找不到可见的输入框（页面结构可能已变，或还停在登录页）',
+        diag: {
+          url: location.href,
+          textareas: document.querySelectorAll('textarea').length,
+          editables: document.querySelectorAll('[contenteditable="true"]').length
+        }
+      });
+    }
+
+    var tried = [];
+    for (var c = 0; c < cands.length; c++) {
+      var attempt = setText(cands[c].el, TEXT);
+      tried.push({ how: cands[c].how, tag: cands[c].el.tagName, result: attempt.how });
+      if (!attempt.ok) continue;
+      if (readInput(cands[c].el).trim().length === 0) {
+        tried[tried.length - 1].result += '+empty-after-fill';
+        continue;
+      }
+      /** 记下填充用的选择器 —— 触发阶段要用同一个元素。 */
+      window.__dshWebinFilledSelector = cands[c].how;
+      return JSON.stringify({
+        ok: true, stage: 'filled',
+        how: attempt.how, selector: cands[c].how,
+        chars: TEXT.length, url: location.href
+      });
+    }
+
+    return JSON.stringify({
+      ok: false, stage: 'fill-failed',
+      message: '试了 ' + tried.length + ' 个候选输入框都没写进去',
+      tried: tried, url: location.href
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, stage: 'fill-error', message: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildTriggerScript(hints, expectText) {
+			const inputSelectors = hints?.inputSelectors ?? [
+				"textarea[placeholder*=\"DeepSeek\"]",
+				"textarea",
+				"div[contenteditable=\"true\"]",
+				"[role=\"textbox\"]"
+			];
+			const sendSelectors = hints?.sendSelectors ?? [
+				"button[type=\"submit\"]",
+				"button[aria-label*=\"send\" i]",
+				"button[aria-label*=\"发送\"]",
+				"[role=\"button\"][aria-label*=\"发送\"]",
+				"[data-testid*=\"send\" i]"
+			];
+			return `(function () {
+  var INPUT_SELECTORS = ${JSON.stringify(inputSelectors)};
+  var SEND_SELECTORS = ${JSON.stringify(sendSelectors)};
+  var SIGNATURES = ${JSON.stringify(hints?.signatures ?? [])};
+  var VETOES = ${JSON.stringify(hints?.vetoes ?? [])};
+  /**
+   * 期望输入框里有的内容（fill 阶段填进去的）。
+   *
+   * ## ⭐ 为什么要把「要发的字」传进来（本轮新修）
+   *
+   * fill 和 trigger 是**两次独立的 executeJavaScript**，中间隔 2–4 秒。
+   * 这期间页面可能重渲染（React 换掉了输入框节点），于是 trigger 找到的
+   * 输入框**可能不是 fill 填的那个** —— 那时点发送会：
+   *   - 发出一条**空消息**，或者
+   *   - 什么都没发生（新节点里没内容，发送键是禁用态）
+   *
+   * 而插件完全不知道，继续等一个永远不会来的回复。
+   *
+   * 现在把期望文本传进来，**点火前先核对**：输入框里确实有我们填的字
+   * 才按发送。对不上就明确报错（而不是赌一把）。
+   *
+   * 空串表示不做这个校验（调用方没传）。
+   */
+  var EXPECT = ${JSON.stringify(expectText ?? "")};
+
+  /**
+   * 归一化后比较（换行 / 首尾空白 / 中间的连续空白都不该导致误判）。
+   * 只比较**前 200 字符** —— 长 prompt 尾部可能被输入框截断显示，
+   * 而我们只需要确认「是同一段内容」。
+   */
+  function sameText(a, b) {
+    if (b === '') return true;
+    var na = String(a || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+    var nb = String(b || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+    return na === nb;
+  }
+
+  function visible(el) {
+    if (!el) return false;
+    try {
+      if (el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+      var r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return true;
+      var s = window.getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    } catch (e) { return false; }
+  }
+
+  function disabled(el) {
+    if (!el) return true;
+    try {
+      if (el.disabled === true) return true;
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  /**
+   * 读输入框当前内容。
+   *
+   * textarea / input 用 value；contenteditable 用 innerText（它比
+   * textContent 更接近用户看到的内容 —— 会忽略隐藏元素）。
+   *
+   * ⚠️ 发送确认靠它判断「页面是否接受了这条消息」。
+   */
+  function readInput(el) {
+    if (!el) return '';
+    try {
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') return String(el.value || '');
+      return String(el.innerText || el.textContent || '');
+    } catch (e) { return ''; }
+  }
+
+  function labelOf(el) {
+    if (!el) return '';
+    var parts = [];
+    try {
+      if (el.getAttribute) {
+        parts.push(el.getAttribute('aria-label') || '');
+        parts.push(el.getAttribute('title') || '');
+        parts.push(el.getAttribute('data-testid') || '');
+        parts.push(el.getAttribute('type') || '');
+      }
+      if (el.className && typeof el.className === 'string') parts.push(el.className);
+      var t = (el.textContent || '').trim();
+      if (t.length <= 24) parts.push(t);
+    } catch (e) { /* ignore */ }
+    return parts.join(' ').toLowerCase();
+  }
+
+  function scoreByLabel(el) {
+    var L = labelOf(el);
+    var s = 0;
+    if (/send|发送|提交|submit/.test(L)) s += 100;
+    for (var i = 0; i < SIGNATURES.length; i++) {
+      try { if (new RegExp(SIGNATURES[i][0]).test(L)) s += SIGNATURES[i][1]; } catch (e) {}
+    }
+    for (var j = 0; j < VETOES.length; j++) {
+      try { if (new RegExp(VETOES[j]).test(L)) s -= 120; } catch (e) {}
+    }
+    return s;
+  }
+
+  function scoreByGeometry(el, input) {
+    try {
+      var a = input.getBoundingClientRect();
+      var b = el.getBoundingClientRect();
+      var score = 0;
+      if (b.top < a.bottom && b.bottom > a.top) score += 20;
+      else if (b.top >= a.bottom - 4 && b.top < a.bottom + 80) score += 15;
+      if (b.left >= a.left + a.width * 0.5) score += 15;
+      var dx = Math.abs(b.left - (a.right - b.width));
+      var dy = Math.abs(b.top - a.bottom);
+      score -= Math.min(30, (dx + dy) / 40);
+      return score;
+    } catch (e) { return 0; }
+  }
+
+  /** 找输入框（触发阶段只需要它做几何参照 + Enter 目标）。 */
+  function findInput() {
+    for (var i = 0; i < INPUT_SELECTORS.length; i++) {
+      var list;
+      try { list = document.querySelectorAll(INPUT_SELECTORS[i]); } catch (e) { continue; }
+      for (var j = 0; j < list.length; j++) {
+        if (visible(list[j]) && !disabled(list[j])) return list[j];
+      }
+    }
+    return null;
+  }
+
+  function pressEnter(el) {
+    var opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, isComposing: false };
+    try { el.dispatchEvent(new KeyboardEvent('keydown', opts)); } catch (e) {}
+    try { el.dispatchEvent(new KeyboardEvent('keypress', opts)); } catch (e) {}
+    try { el.dispatchEvent(new KeyboardEvent('keyup', opts)); } catch (e) {}
+  }
+
+  try {
+    var input = findInput();
+    if (!input) return JSON.stringify({ ok: false, message: '触发时找不到输入框', url: location.href });
+
+    /**
+     * ## ⭐ 点火前核对：输入框里确实是我们填的字吗
+     *
+     * 见 EXPECT 的说明 —— 两次调用之间页面可能重渲染，换掉了输入框节点。
+     * 那时按发送会发空消息或什么都不发生，而插件不知道。
+     *
+     * ⚠️ 核对失败**不直接放弃**，而是重新找一遍输入框：
+     * React 换节点是常见现象，新节点里内容通常还在（React 会保留 state）。
+     * 重找之后还没有，才报错。
+     */
+    if (!sameText(readInput(input), EXPECT)) {
+      /** 重新扫一遍所有候选，看是不是换了节点。 */
+      var again = null;
+      for (var q = 0; q < INPUT_SELECTORS.length && !again; q++) {
+        var ql;
+        try { ql = document.querySelectorAll(INPUT_SELECTORS[q]); } catch (e) { continue; }
+        for (var qj = 0; qj < ql.length; qj++) {
+          if (visible(ql[qj]) && !disabled(ql[qj]) && sameText(readInput(ql[qj]), EXPECT)) {
+            again = ql[qj];
+            break;
+          }
+        }
+      }
+      if (again) {
+        /** 找到带内容的那个节点 —— 用它继续。 */
+        input = again;
+      } else {
+        /**
+         * ## ⚠️ 找不到「带我们那段字」的输入框时，**不能直接判失败**
+         *
+         * 第一版直接报 「input-lost」。但有几种**正常**情况会走到这里：
+         *
+         *   1. **页面已经接受了这条消息**（用户手快点了发送、或按了快捷键），
+         *      输入框被清空 ⇒ 当然找不到我们的字
+         *   2. React 重渲染把内容换成等价的 DOM（空白/换行不同），
+         *      「sameText」 的归一化没覆盖到
+         *
+         * 这两种情况下判失败会让用户看到**假的** send-failed，
+         * 而消息其实已经发出去了。
+         *
+         * 所以分情况：
+         *   - 输入框**空着** ⇒ 内容已被搬走 ⇒ 视为已发送（交给后续 DOM 轮询确认）
+         *   - 输入框**有内容但不是我们的** ⇒ fill 被顶掉了 ⇒ 报错
+         *     （这时发出去会发错内容，必须拦）
+         */
+        var current = readInput(input);
+        if (current.trim() === '') {
+          return JSON.stringify({
+            ok: true,
+            how: 'already-sent',
+            method: 'none',
+            confirmed: false,
+            note: 'input-empty-before-send',
+            url: location.href,
+          });
+        }
+        return JSON.stringify({
+          ok: false,
+          reason: 'input-lost',
+          message: '输入框里的内容变了（不是刚填进去的那段）—— 没有发送，请重试',
+          got: current.slice(0, 60),
+          url: location.href,
+        });
+      }
+    }
+
+    /**
+     * 收集候选发送控件：平台声明的语义选择器优先，再用「输入框附近」
+     * 与特征加分兜底（DeepSeek 的发送键是纯图标 div，没有文字）。
+     */
+    var out = [];
+    var seen = [];
+    function push(el, how, weight) {
+      if (!el || !visible(el) || disabled(el)) return;
+      for (var s = 0; s < seen.length; s++) if (seen[s] === el) return;
+      seen.push(el);
+      /* 输入框本体不算发送键。 */
+      if (el === input) return;
+      out.push({ el: el, how: how, score: weight + scoreByLabel(el) + scoreByGeometry(el, input) });
+    }
+
+    for (var i = 0; i < SEND_SELECTORS.length; i++) {
+      var list;
+      try { list = document.querySelectorAll(SEND_SELECTORS[i]); } catch (e) { continue; }
+      for (var j = 0; j < list.length; j++) push(list[j], SEND_SELECTORS[i], 100);
+    }
+
+    /** 输入框附近（往上 6 层）的按钮。 */
+    var box = input;
+    for (var k = 0; k < 6 && box; k++) {
+      box = box.parentElement;
+      if (!box) break;
+      var near;
+      try { near = box.querySelectorAll('button, [role="button"], [role="submit"], div[tabindex]'); } catch (e) { break; }
+      for (var m = 0; m < near.length; m++) push(near[m], 'near-input(L' + (k + 1) + ')', 40 - k * 5);
+    }
+
+    out.sort(function (a, b) { return b.score - a.score; });
+    var best = out.length > 0 ? out[0] : null;
+
+    /**
+     * ⚠️ 与 cuckoo 一致的策略：**先点按钮，找不到才用 Enter**。
+     *
+     * 两个都做（点按钮 + 补 Enter）不行 —— 那可能发出两条。
+     * 所以只选一个：有够分（>0）的候选按钮就点它，否则合成 Enter。
+     */
+    var how;
+    var method;
+    if (best && best.score > 0) {
+      try { best.el.click(); } catch (e) {}
+      how = best.how;
+      method = 'click';
+    } else {
+      pressEnter(input);
+      how = 'enter';
+      method = 'enter';
+    }
+
+    /**
+     * ## ⭐⭐ 发送**确认**（用户报的「网页版早就有答案了，dsh 还在深度求索」）
+     *
+     * ## 为什么必须确认
+     *
+     * 早期这里点完就返回 ok:true，**从不验证**。于是「点了但没生效」
+     * （按钮被遮挡 / 是禁用态 / 点了别的元素）时，插件以为发出去了，
+     * 一路等一个**永远不会来的回复**。
+     *
+     * ## 判据：输入框被清空
+     *
+     * 页面接受发送时**一定会清空输入框**（把内容搬进消息列表）。
+     * 这个信号不依赖任何注入时机（hook 装不上也能用）。
+     *
+     * ## ⚠️⚠️ 但必须**每次重新找输入框**（我第一版漏了，造成误报）
+     *
+     * 第一版在点击**之前**抓了一个 「input」 引用，之后一直读它。
+     * 问题是：React 发送后会**重渲染**，那个节点可能已经被**摘除**
+     * （detached）—— 读一个摘除节点的 「.value」 **永远是发送前的内容**，
+     * 于是判据恒为「没清空」⇒ **误报 send-failed**。
+     *
+     * 用户实测（截图）：「网页版 ldw 早就输出完了」，而 DSH 报
+     * 「send-failed: 消息没有真正发出去（输入框没被清空）」——
+     * 就是读了一个摘除的旧节点。
+     *
+     * 现在每一轮探测都**重新 「findInput()」**，并且：
+     *   - 找不到输入框 ⇒ 也算「页面接受了」（输入框可能被整体换掉）
+     *   - 找到但已清空 ⇒ 接受
+     *   - 找到且内容明显变短 ⇒ 接受
+     *
+     * ⚠️ 只等 **1.2 秒**（分几次探）：真实发送时 React 几乎立刻清空。
+     * 1.2 秒内没动静 ⇒ 判定失败并**立刻交错误**，不干等到超时。
+     */
+    return new Promise(function (resolve) {
+      var before = readInput(input);
+      var tries = 0;
+      var MAX_TRIES = 6;      /* 6 × 200ms = 1.2s */
+      function ok(extra) {
+        var o = {
+          ok: true, how: how, method: method, confirmed: true,
+          candidates: out.slice(0, 5).map(function (c) { return { how: c.how, score: Math.round(c.score) }; }),
+          url: location.href
+        };
+        for (var k in extra) if (extra[k] !== undefined) o[k] = extra[k];
+        resolve(JSON.stringify(o));
+      }
+      function probe() {
+        tries++;
+        /**
+         * ⭐ **重新找输入框** —— 不能复用点击前抓的引用（它可能已被摘除）。
+         */
+        var fresh = findInput();
+        if (!fresh) {
+          /**
+           * 找不到输入框 ⇒ 页面多半正在切换/重渲染 ⇒ 算发送成功。
+           *
+           * 为什么不判失败：判失败会让用户看到一个**假的** send-failed
+           * （而消息其实发出去了）。宁可放过，交给后续的 DOM 轮询确认 ——
+           * 那里有 30 秒早期放弃兜底，不会真的干等。
+           */
+          ok({ note: 'input-gone' });
+          return;
+        }
+        var now = readInput(fresh);
+        /** 输入框空了（或至少明显变短）⇒ 页面接受了。 */
+        if (now.trim() === '' || (before !== '' && now.length < before.length * 0.5)) {
+          ok({});
+          return;
+        }
+        if (tries >= MAX_TRIES) {
+          resolve(JSON.stringify({
+            ok: false, how: how, method: method, confirmed: false,
+            reason: 'input-not-cleared',
+            message: '点了发送但输入框没被清空 —— 消息很可能没发出去',
+            left: now.slice(0, 40),
+            candidates: out.slice(0, 5).map(function (c) { return { how: c.how, score: Math.round(c.score) }; }),
+            url: location.href
+          }));
+          return;
+        }
+        setTimeout(probe, 200);
+      }
+      /** 先给页面一个 tick 处理点击，再开始探。 */
+      setTimeout(probe, 120);
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, message: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildClearInputScript(hints) {
+			const inputSelectors = hints?.inputSelectors ?? [
+				"textarea[placeholder*=\"DeepSeek\"]",
+				"textarea",
+				"div[contenteditable=\"true\"]",
+				"[role=\"textbox\"]"
+			];
+			return `(function () {
+  var INPUT_SELECTORS = ${JSON.stringify(inputSelectors)};
+
+  function visible(el) {
+    if (!el) return false;
+    try { return el.offsetWidth > 0 && el.offsetHeight > 0; } catch (e) { return false; }
+  }
+
+  try {
+    var hit = null;
+    for (var i = 0; i < INPUT_SELECTORS.length && !hit; i++) {
+      var list;
+      try { list = document.querySelectorAll(INPUT_SELECTORS[i]); } catch (e) { continue; }
+      for (var j = 0; j < list.length; j++) {
+        if (visible(list[j])) { hit = list[j]; break; }
+      }
+    }
+    if (!hit) return JSON.stringify({ ok: false, reason: 'no-input' });
+
+    hit.focus();
+    if (hit.tagName === 'TEXTAREA' || hit.tagName === 'INPUT') {
+      /** 走原生 setter —— 直接赋值不会触发 React 的 onChange。 */
+      var proto = hit.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(hit, '');
+      else hit.value = '';
+      try { hit.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      return JSON.stringify({ ok: true, how: 'native-setter' });
+    }
+
+    /** contenteditable：selectAll + delete。 */
+    try {
+      document.execCommand('selectAll', false, undefined);
+      document.execCommand('delete', false, undefined);
+    } catch (e) {}
+    var left = String(hit.innerText || hit.textContent || '').trim();
+    if (left !== '') {
+      /** 兜底：直接清 textContent 再补事件。 */
+      hit.textContent = '';
+      try { hit.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      left = String(hit.innerText || hit.textContent || '').trim();
+    }
+    return JSON.stringify({ ok: left === '', how: 'execCommand-delete', left: left.slice(0, 40) });
+  } catch (e) {
+    return JSON.stringify({ ok: false, reason: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildThinkingScript(want) {
+			return `(function () {
+  var want = ${want ? "true" : "false"};
+  var KW = /深度思考|思考|deep\\s*think|think|reason|推理|R1/i;
+
+  function visible(el) {
+    if (!el) return false;
+    if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
+    var s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) > 0.05;
+  }
+
+  /** 开关当前是否「已开启」。三种表达方式任一命中即算开。 */
+  function isOn(el) {
+    if (el.getAttribute('aria-pressed') === 'true') return true;
+    if (el.getAttribute('aria-checked') === 'true') return true;
+    var st = el.getAttribute('data-state');
+    if (st === 'on' || st === 'checked' || st === 'active') return true;
+    var cls = String(el.className || '');
+    if (/(^|[\\s-])(active|selected|checked|enabled)([\\s-]|$)/i.test(cls)) return true;
+    return false;
+  }
+
+  /** 输入框用作几何参照；找不到就退化成「只按文本找」。 */
+  var ta = document.querySelector('textarea, div[contenteditable="true"]');
+  var box = ta ? ta.getBoundingClientRect() : null;
+
+  var sel = 'button, [role="button"], [role="switch"], [role="radio"], [role="menuitemcheckbox"], label, [aria-pressed], [aria-checked], [data-state]';
+  var list = document.querySelectorAll(sel);
+  var scored = [];
+  for (var i = 0; i < list.length; i++) {
+    var el = list[i];
+    if (!visible(el)) continue;
+    var text = String(el.textContent || '').replace(/\\s+/g, ' ').trim();
+    var aria = el.getAttribute('aria-label') || '';
+    var title = el.getAttribute('title') || '';
+    var hay = text + ' ' + aria + ' ' + title;
+
+    var score = 0;
+    if (KW.test(hay)) score += 100;
+    if (el.getAttribute('aria-pressed') !== null) score += 20;
+    if (el.getAttribute('aria-checked') !== null) score += 20;
+    if (el.getAttribute('role') === 'switch') score += 20;
+    if (box) {
+      var r = el.getBoundingClientRect();
+      if (r.bottom <= box.top + 20 && r.bottom >= box.top - 140 && r.right > box.left && r.left < box.right) score += 40;
+    }
+    if (score < 100) continue;
+
+    scored.push({
+      score: score, el: el,
+      text: text.slice(0, 40), aria: aria, on: isOn(el),
+      disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+      tag: el.tagName, cls: String(el.className || '').slice(0, 70)
+    });
+  }
+
+  if (scored.length === 0) {
+    return JSON.stringify({ ok: false, reason: 'no-toggle', want: want, found: 0 });
+  }
+
+  scored.sort(function (a, b) { return b.score - a.score; });
+  var best = scored[0];
+
+  /** 有歧义（多个同分候选且状态不一致）时不盲点 —— 点错可能把已开的关掉。 */
+  if (scored.length > 1 && scored[1].score === best.score && scored[1].on !== best.on) {
+    return JSON.stringify({
+      ok: false, reason: 'ambiguous', want: want,
+      candidates: scored.slice(0, 4).map(function (c) { return { text: c.text, aria: c.aria, on: c.on, score: c.score }; })
+    });
+  }
+
+  var before = best.on;
+  if (best.disabled) {
+    return JSON.stringify({ ok: false, reason: 'disabled', want: want, before: before, text: best.text });
+  }
+  if (before === want) {
+    return JSON.stringify({ ok: true, changed: false, before: before, after: before, text: best.text, score: best.score });
+  }
+
+  /** 真实鼠标事件序列 —— 有些框架只认 pointerdown / mouseup。 */
+  try {
+    var r2 = best.el.getBoundingClientRect();
+    var opts = {
+      bubbles: true, cancelable: true,
+      clientX: r2.left + r2.width / 2, clientY: r2.top + r2.height / 2
+    };
+    /**
+     * view 只在浏览器里有意义。用 try 兜住 ——
+     * 某些环境（测试桩 / 隔离上下文）没有 window，硬引用会让整个脚本抛错，
+     * 那样连「点一下」都做不到。
+     */
+    try { opts.view = window; } catch (e) {}
+    try { best.el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
+    best.el.dispatchEvent(new MouseEvent('mousedown', opts));
+    try { best.el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+    best.el.dispatchEvent(new MouseEvent('mouseup', opts));
+    best.el.dispatchEvent(new MouseEvent('click', opts));
+  } catch (e) {
+    return JSON.stringify({ ok: false, reason: 'click-failed: ' + String(e && e.message), want: want, before: before });
+  }
+
+  var after = isOn(best.el);
+  return JSON.stringify({
+    ok: after === want, changed: true, before: before, after: after, want: want,
+    text: best.text, score: best.score,
+    reason: after === want ? undefined : 'click-did-not-change-state'
+  });
+})()`;
+		}
+
+		function buildStopScript(hints) {
+			const sendSelectors = hints?.sendSelectors ?? ["button[type=\"submit\"]"];
+			const vetoes = hints?.vetoes ?? [];
+			return `(function () {
+  try {
+    function visible(el) {
+      if (!el) return false;
+      try {
+        if (el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      } catch (e) { return false; }
+    }
+    function labelOf(el) {
+      var parts = [];
+      try {
+        if (el.getAttribute) {
+          parts.push(el.getAttribute('aria-label') || '');
+          parts.push(el.getAttribute('title') || '');
+          parts.push(el.getAttribute('data-testid') || '');
+        }
+        if (el.className && typeof el.className === 'string') parts.push(el.className);
+        var t = (el.textContent || '').trim();
+        if (t.length <= 24) parts.push(t);
+      } catch (e) {}
+      return parts.join(' ').toLowerCase();
+    }
+
+    var all;
+    try { all = document.querySelectorAll('button, [role="button"]'); } catch (e) { all = []; }
+    var hits = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!visible(el)) continue;
+      var L = labelOf(el);
+
+      // ---- 一票否决：绝不能误点的东西 ----
+      var vetoed = false;
+      var vs = ${JSON.stringify(vetoes)};
+      for (var v = 0; v < vs.length; v++) {
+        try { if (new RegExp(vs[v]).test(L)) { vetoed = true; break; } } catch (e) {}
+      }
+      if (vetoed) continue;
+      if (/附件|attach|上传|upload|深度思考|智能搜索|联网/.test(L)) continue;
+
+      // ---- 强语义：文本/aria 明确说停止 ----
+      if (/stop|停止|中断|abort/.test(L)) { hits.push({ el: el, score: 100, why: 'semantic' }); continue; }
+
+      // ---- 站点特征（实测校准）----
+      // 发送键独有 ⇒ 明确排除
+      if (/ds-button--filled|ds-button--primary/.test(L)) continue;
+      // 命中发送选择器也排除
+      var sels = ${JSON.stringify(sendSelectors)};
+      var isSend = false;
+      for (var s = 0; s < sels.length; s++) {
+        try { if (el.matches && el.matches(sels[s])) { isSend = true; break; } } catch (e) {}
+      }
+      if (isSend) continue;
+
+      var score = 0;
+      // 停止键独有：--outlined
+      if (/ds-button--outlined/.test(L)) score += 60;
+      if (/ds-button--outlinedneutral/.test(L)) score += 20;
+      // 圆形是共有特征，只给很小的分
+      if (/ds-button--circle/.test(L)) score += 10;
+
+      if (score >= 60) hits.push({ el: el, score: score, why: L.slice(0, 50) });
+    }
+
+    if (!hits.length) return JSON.stringify({ ok: false, reason: 'no-stop-control' });
+    hits.sort(function (a, b) { return b.score - a.score; });
+    var top = hits[0];
+
+    // 分数并列时不敢猜 —— 宁可不停止，也不能点错
+    if (hits.length > 1 && hits[1].score === top.score) {
+      return JSON.stringify({ ok: false, reason: 'ambiguous', candidates: hits.length, top: top.score });
+    }
+
+    try {
+      top.el.click();
+      return JSON.stringify({ ok: true, how: top.why, score: top.score, candidates: hits.length });
+    } catch (e) {
+      return JSON.stringify({ ok: false, reason: 'click-failed', message: String(e && e.message) });
+    }
+  } catch (e) {
+    return JSON.stringify({ ok: false, reason: 'exception', message: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildContinueScript(hints) {
+			const sendSelectors = hints?.sendSelectors ?? ["button[type=\"submit\"]"];
+			const vetoes = hints?.vetoes ?? [];
+			return `(function () {
+  try {
+    function visible(el) {
+      if (!el) return false;
+      try {
+        if (el.offsetWidth > 0 && el.offsetHeight > 0) return true;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      } catch (e) { return false; }
+    }
+    function labelOf(el) {
+      var parts = [];
+      try {
+        if (el.getAttribute) {
+          parts.push(el.getAttribute('aria-label') || '');
+          parts.push(el.getAttribute('title') || '');
+          parts.push(el.getAttribute('data-testid') || '');
+        }
+        if (el.className && typeof el.className === 'string') parts.push(el.className);
+        var t = (el.textContent || '').trim();
+        if (t.length <= 24) parts.push(t);
+      } catch (e) {}
+      return parts.join(' ').toLowerCase();
+    }
+
+    var all;
+    try { all = document.querySelectorAll('button, [role="button"]'); } catch (e) { all = []; }
+    var hits = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!visible(el)) continue;
+      var L = labelOf(el);
+
+      // ---- 一票否决：绝不能误点的东西 ----
+      var vetoed = false;
+      var vs = ${JSON.stringify(vetoes)};
+      for (var v = 0; v < vs.length; v++) {
+        try { if (new RegExp(vs[v]).test(L)) { vetoed = true; break; } } catch (e) {}
+      }
+      if (vetoed) continue;
+      /**
+       * ⚠️ 「停止」必须排除：它和「继续生成」在**同一个操作条**上，
+       * 点错就真把生成停了。发送键同理（会发出空消息）。
+       */
+      if (/附件|attach|上传|upload|深度思考|智能搜索|联网/.test(L)) continue;
+      if (/stop|停止|中断|abort|发送|send|submit/.test(L)) continue;
+      if (/ds-button--filled|ds-button--primary/.test(L)) continue;
+      var sels = ${JSON.stringify(sendSelectors)};
+      var isSend = false;
+      for (var s = 0; s < sels.length; s++) {
+        try { if (el.matches && el.matches(sels[s])) { isSend = true; break; } } catch (e) {}
+      }
+      if (isSend) continue;
+
+      // ---- 只认强语义，不靠 class 猜 ----
+      var score = 0;
+      if (/继续生成|继续回答|continue generating|regenerate|重新生成/.test(L)) score = 100;
+      else if (/(^|\\s)继续(\\s|$)|(^|\\s)continue(\\s|$)/.test(L)) score = 80;
+
+      if (score >= 80) hits.push({ el: el, score: score, why: L.slice(0, 60) });
+    }
+
+    if (!hits.length) return JSON.stringify({ ok: false, reason: 'no-continue-control' });
+    hits.sort(function (a, b) { return b.score - a.score; });
+
+    // 分数并列时不敢猜 —— 宁可不点，也绝不点错
+    if (hits.length > 1 && hits[1].score === hits[0].score) {
+      return JSON.stringify({ ok: false, reason: 'ambiguous', candidates: hits.length, top: hits[0].score });
+    }
+
+    var top = hits[0];
+    try {
+      top.el.click();
+      return JSON.stringify({ ok: true, how: top.why, score: top.score, candidates: hits.length });
+    } catch (e) {
+      return JSON.stringify({ ok: false, reason: 'click-failed', message: String(e && e.message) });
+    }
+  } catch (e) {
+    return JSON.stringify({ ok: false, reason: 'exception', message: String(e && e.message) });
+  }
+})();`;
+		}
+
+		function buildChromeUserAgent() {
+			return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${/Chrome\/(\d+)/.exec(navigator.userAgent)?.[1] ?? "0"}.0.0.0 Safari/537.36`;
+		}
+
+		function fingerprintFix() {
+			const major = /Chrome\/(\d+)/.exec(navigator.userAgent)?.[1] ?? "0";
+			return `(function(){try{
+var m=${JSON.stringify(major)};
+var brands=[{brand:"Google Chrome",version:m},{brand:"Chromium",version:m},{brand:"Not_A Brand",version:"24"}];
+var uad={brands:brands,mobile:false,platform:"Windows",
+getHighEntropyValues:function(){return Promise.resolve({architecture:"x86",bitness:"64",brands:brands,mobile:false,platform:"Windows",platformVersion:"10.0.0",uaFullVersion:m+".0.0.0",fullVersionList:brands});},
+toJSON:function(){return{brands:brands,mobile:false,platform:"Windows"};}};
+try{Object.defineProperty(navigator,"userAgentData",{get:function(){return uad;},configurable:true});}catch(e){}
+try{Object.defineProperty(navigator,"webdriver",{get:function(){return false;},configurable:true});}catch(e){}
+}catch(e){}})();`;
+		}
+
+export {
+  buildDeepSeekHook,
+  buildProbeScript,
+  buildSnapshotScript,
+  buildDrainScript,
+  buildScrollScript,
+  buildScrapeScript,
+  buildFillScript,
+  buildTriggerScript,
+  buildClearInputScript,
+  buildThinkingScript,
+  buildStopScript,
+  buildContinueScript,
+  buildChromeUserAgent,
+  fingerprintFix,
+};
