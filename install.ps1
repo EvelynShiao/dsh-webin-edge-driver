@@ -62,67 +62,13 @@ Copy-Item $PluginDir $bak -Recurse -Force
 $n = (Get-ChildItem $bak -Recurse -File | Measure-Object).Count
 Ok "备份完成（$n 个文件）"
 
-# ── 2. 放文件 ───────────────────────────────────────────────
+# ── 2. 放文件（整文件覆盖 —— 补丁版 lib 已含全部改动，天然幂等） ──
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-foreach ($f in @('edge-driver.js','edge-driver-scripts.js')) {
+foreach ($f in @('edge-driver.js','edge-driver-scripts.js','index.js','client.js')) {
     $src = Join-Path $here "patch\$f"
     if (-not (Test-Path $src)) { Die "缺少 patch\$f" }
     Copy-Item $src (Join-Path $libDir $f) -Force
     Ok "放入 lib\$f"
-}
-
-# ── 3. 给 index.js 打补丁 ───────────────────────────────────
-Info "给 lib\index.js 打补丁…"
-$src = Get-Content $indexJs -Raw
-$orig = $src
-
-function InsertOnce {
-    param([string]$Needle, [string]$Anchor, [string]$Payload, [string]$Label, [string]$Where = 'after')
-    if ($script:src.Contains($Needle)) { Ok "$Label 已存在，跳过"; return }
-    $i = $script:src.IndexOf($Anchor)
-    if ($i -lt 0) { Warn "$Label 找不到锚点，跳过（手动装吧）"; return }
-    if ($Where -eq 'after') {
-        $at = $i + $Anchor.Length
-        $script:src = $script:src.Substring(0, $at) + $Payload + $script:src.Substring($at)
-    } else {
-        $script:src = $script:src.Substring(0, $i) + $Payload + $script:src.Substring($i)
-    }
-    $script:Changed++
-    Ok "$Label 已插入"
-}
-
-# 3a) import
-InsertOnce `
-    -Needle 'from "./edge-driver.js"' `
-    -Anchor 'import { homedir } from "node:os";' `
-    -Payload "`nimport { EdgeDriver, EDGE_DRIVER_DEFAULTS } from `"./edge-driver.js`";" `
-    -Label 'import EdgeDriver'
-
-# 3b) checkConfig 里加归一化
-InsertOnce `
-    -Needle 'normalizeEdgeDriverConfig' `
-    -Anchor 'out.edgeDriver = normalizeEdgeDriverConfig' `
-    -Payload '' -Label 'checkConfig 钩子（探针：若报“找不到锚点”，见 README 手动步骤）'
-if (-not $src.Contains('normalizeEdgeDriverConfig')) {
-    InsertOnce `
-        -Needle 'out.edgeDriver = normalizeEdgeDriverConfig(src.edgeDriver, problems);' `
-        -Anchor 'return {' `
-        -Payload '' -Label 'checkConfig 钩子占位'
-}
-
-# 3c) /status 暴露
-InsertOnce `
-    -Needle 'edgeDriver: edgeDriver.status()' `
-    -Anchor 'plugin: name,' `
-    -Payload "`n`t`t`t`t`tedgeDriver: edgeDriver.status()," `
-    -Label '/status 暴露 edgeDriver'
-
-# 写回（只有真改了才写）
-if ($script:src -ne $orig) {
-    Set-Content $indexJs -Value $script:src -NoNewline -Encoding UTF8
-    Ok "index.js 已更新（$script:Changed 处）"
-} else {
-    Ok "index.js 无需改动"
 }
 
 # ── 4. config.json ──────────────────────────────────────────

@@ -112,7 +112,8 @@ export const EDGE_DRIVER_DEFAULTS = {
    * 如果你**想留着**网页版里的对话记录回头翻（比如喜欢在网页版看历史），
    * 就把它关掉。默认**开**，因为默认观点是「DSH 里的对话记录才是正本」。
    */
-  autoDeleteSessions: true,
+  /** 默认关闭自动删会话；仅在 provider 明确声明安全的删除器后才可开启。 */
+  autoDeleteSessions: false,
   /**
    * 刚建的对话可能还没被服务端收录（列表要过一会才出现），
    * 所以删除前先等一小会儿再查。
@@ -347,7 +348,7 @@ export class EdgeDriver {
   // ── 启动 ───────────────────────────────────────────────────
 
   /** 起 Edge（如果还没起）+ 连 CDP + 定位到聊天页。幂等。 */
-  async ensureEdge(platformId) {
+  async ensureEdge(platformId, accountId) {
     if (this.config.enabled !== true) throw new Error("edge-driver 未启用");
 
     /**
@@ -365,14 +366,16 @@ export class EdgeDriver {
      * profile 目录会互相顶掉（Edge 是单例，后启动的会把自己转交给先启动的）。
      */
     const wanted = typeof platformId === "string" && platformId !== "" ? platformId : this.platformId;
-    if (wanted !== this.platformId) {
-      this.log.info?.(`[edge-driver] 切换平台 ${this.platformId} → ${wanted}，先收掉上一个浏览器`);
-      await this.shutdownEdge("切换平台");
+    this.accountId = typeof accountId === "string" && accountId !== "" ? accountId : (this.accountId ?? "default");
+    const accountKey = this.accountId;
+    if (wanted !== this.platformId || (this._activeAccountId && accountKey !== this._activeAccountId)) {
+      this.log.info?.(`[edge-driver] 切换 profile ${this.platformId}#${this._activeAccountId ?? "default"} → ${wanted}#${accountKey}`);
+      await this.shutdownEdge("切换网站/账号");
       this.platformId = wanted;
     }
-    /** 当前平台的端口与 profile（由 platformId 派生，保证一平台一套）。 */
-    const port = this.portFor(this.platformId);
-    const dir = this.userDataDirFor(this.platformId);
+    this._activeAccountId = accountKey;
+    const port = this.portFor(this.platformId, accountKey);
+    const dir = this.userDataDirFor(this.platformId, accountKey);
 
     // ① 已经连上就直接复用。
     if (this.conn !== null && this.conn.closed === false && this.proc !== null && this._port === port) return this;
@@ -490,29 +493,17 @@ export class EdgeDriver {
     }
   }
 
-  /**
-   * 某个平台用哪个调试端口。
-   *
-   * 一平台一端口，避免多平台抢同一个 CDP 端点。
-   * 顺序由 `_platformOrder` 决定（首次见到的平台排 0，第二个排 1…），
-   * 保证同一个平台每次拿到同一个端口（否则重启后端口漂移，复用逻辑会失效）。
-   */
-  portFor(platformId) {
-    const order = this._platformOrder ?? (this._platformOrder = new Map());
-    if (!order.has(platformId)) order.set(platformId, order.size);
-    return this.config.port + order.get(platformId);
+  /** Driver 串行切换 profile，故所有网站复用一个端口即可；身份隔离由 userDataDir 保证。 */
+  portFor(_platformId, _accountId = "default") {
+    return this.config.port;
   }
 
-  /**
-   * 某个平台用哪个 profile 目录。
-   *
-   * 目录名用**平台 id**（不是随机值）—— 这样登录态跟着平台走，
-   * 重启后还在原地，不用重新登录。原版 webin 的 partition 是随机的
-   * 内存分区，那正是它「每次重启都要重新登录」的根因。
-   */
-  userDataDirFor(platformId) {
+  /** 登录资料目录按「网站/账号槽位」隔离。槽位只允许安全字符，不包含手机号或凭证。 */
+  userDataDirFor(platformId, accountId = "default") {
     const base = resolveUserDataDir(this.config.userDataDir);
-    return join(base, String(platformId).replace(/[^A-Za-z0-9_-]/g, "_"));
+    const safePlatform = String(platformId).replace(/[^A-Za-z0-9_-]/g, "_");
+    const safeAccount = String(accountId || "default").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48);
+    return join(base, safePlatform, safeAccount || "default");
   }
 
   /** 等 CDP 端口可用。 */
@@ -575,19 +566,77 @@ export class EdgeDriver {
     return r.result?.value;
   }
 
-  // ── 登录态 / 快照 ──────────────────────────────────────────
-
-  async probe() {
-    try {
-      return JSON.parse(String(await this.evalInPage(buildProbeScript(), 15000)));
-    } catch {
-      return { loggedIn: false };
+  // ── 文件上传（压缩 .txt 通道用）────────────────────────────
+  /**
+   * 把本地文件塞进页面文件上传控件。
+   * 流程：页面上确认存在 input[type=file] → DOM.querySelectorAll 拿 nodeId
+   * → DOM.setFileInputFiles 写入本地文件（CDP 官方上传通道）→ 派发 change。
+   */
+  async uploadFileToPage(filePath, timeoutMs = 20000) {
+    if (this.conn === null) throw new Error("CDP 未连接（先 attach）");
+    try { await this.conn.send("DOM.enable"); } catch { /* 已启用则忽略 */ }
+    const findExpr = `(() => {
+      const inputs = [...document.querySelectorAll('input[type=file]')];
+      const visible = (e) => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+      const el = inputs.find(visible) ?? inputs[0];
+      if (!el) return JSON.stringify({ ok: false, stage: 'no-file-input', message: '页面上没有 input[type=file] —— 可能还没登录或页面结构变了' });
+      return JSON.stringify({ ok: true });
+    })()`;
+    const probe = JSON.parse(String(await this.evalInPage(findExpr, 10000)));
+    if (probe.ok !== true) return probe;
+    const doc = await this.conn.send("DOM.getDocument", { depth: -1 }, timeoutMs);
+    const q = await this.conn.send("DOM.querySelectorAll", {
+      nodeId: doc.root.nodeId,
+      selector: 'input[type=file]',
+    }, timeoutMs);
+    if (!q.nodeIds || q.nodeIds.length === 0) {
+      return { ok: false, stage: 'no-node-id', message: 'DOM 查询没拿到上传控件节点' };
     }
+    let lastErr = null;
+    for (const nodeId of q.nodeIds) {
+      try {
+        await this.conn.send("DOM.setFileInputFiles", {
+          files: [filePath],
+          nodeId,
+        }, timeoutMs);
+        await this.evalInPage(`(() => {
+          const inputs = [...document.querySelectorAll('input[type=file]')];
+          const el = inputs[0];
+          if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+          return 'ok';
+        })()`, 8000);
+        return { ok: true };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    return { ok: false, stage: 'set-files-failed', message: `setFileInputFiles 全部失败: ${lastErr?.message ?? lastErr}` };
   }
 
-  /** 生成 webin 原生格式的快照（host 侧据此判断「登录过」）。 */
-  async snapshot() {
-    return await this.evalInPage(buildSnapshotScript(), 15000);
+  // ── 登录态 / 快照 ──────────────────────────────────────────
+
+  async probe(provider = this.getProvider(this.platformId)) {
+    // DeepSeek 原生登录探针只适用于 DeepSeek；其它站点必须声明经实测的 authProbe。
+    if (provider?.id === "deepseek") {
+      try { return JSON.parse(String(await this.evalInPage(buildProbeScript(), 15000))); }
+      catch { return { loggedIn: false }; }
+    }
+    const auth = provider?.authProbe;
+    if (auth?.type !== "dom" || !Array.isArray(auth.loggedOutSelectors) || !Array.isArray(auth.loggedInSelectors)) {
+      return { loggedIn: false, unsupported: true, reason: "该站点尚无经过验证的登录探针" };
+    }
+    try {
+      const spec = JSON.stringify({ loggedOutSelectors: auth.loggedOutSelectors, loggedInSelectors: auth.loggedInSelectors });
+      const expr = `(() => { const s=${spec}; const visible=(e)=>!!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length)); const out=s.loggedOutSelectors.some(q=>{try{return [...document.querySelectorAll(q)].some(visible)}catch{return false}}); const yes=s.loggedInSelectors.some(q=>{try{return [...document.querySelectorAll(q)].some(visible)}catch{return false}}); return JSON.stringify({loggedIn:yes&&!out,url:location.href,loginUi:out}) })()`;
+      return JSON.parse(String(await this.evalInPage(expr, 15000)));
+    } catch { return { loggedIn: false }; }
+  }
+
+  /** DeepSeek 保留原快照；其它站只保存无秘密的登录判定标记。 */
+  async snapshot(provider = this.getProvider(this.platformId)) {
+    if (provider?.id === "deepseek") return await this.evalInPage(buildSnapshotScript(), 15000);
+    const p = await this.probe(provider);
+    return JSON.stringify({ provider: provider?.id ?? "unknown", loggedIn: p.loggedIn === true, at: Date.now() });
   }
 
   // ── 导航 ───────────────────────────────────────────────────
@@ -613,7 +662,9 @@ export class EdgeDriver {
 
   /** 注入 webin 原生 hook（幂等，自带 MARKER）。 */
   async ensureHook(provider) {
-    const hook = buildDeepSeekHook(provider?.completionPath ?? "/api/v0/chat/completion", provider?.stopPath);
+    // 此 hook 解析的是 DeepSeek 私有 SSE 协议，不能仅换 completionPath 就用于其它站。
+    if (provider?.id !== "deepseek") return "unsupported-provider-hook";
+    const hook = buildDeepSeekHook(provider.completionPath, provider.stopPath);
     const r = await this.evalInPage(hook, 20000);
     if (r !== "already-installed") this.hookInjectedAt = Date.now();
     return r;
@@ -629,9 +680,13 @@ export class EdgeDriver {
     const prompt = String(job.prompt ?? "");
     if (prompt === "") throw new Error("任务没有 prompt");
 
-    // 0) 记住任务开始前网页里有哪些对话 —— 干完活好判断哪条是本轮新建的
-    if (this.config.autoDeleteSessions === true) {
-      this._sessionsBefore = await this.listSessions().catch(() => null);
+    // 0) 只在 provider 明确声明具备已验证的会话列表+删除适配时，记录删除基线。
+    // 未适配站点一律不调用 DeepSeek API，防止误删或错误请求。
+    const canDeleteSessions = this.config.autoDeleteSessions === true && (provider?.sessionApi?.verified === true || provider?.sessionApi?.verified === "deepseek-v1") && provider?.sessionApi?.list === true && provider?.sessionApi?.delete === true;
+    if (canDeleteSessions) {
+      this._sessionsBefore = await this.listSessions(provider).catch(() => null);
+    } else {
+      this._sessionsBefore = null;
     }
 
     // 1) 确认在正确的页面
@@ -660,7 +715,7 @@ export class EdgeDriver {
     await sleep(1500);
 
     // 2) 登录守卫 —— 未登录时把窗口叫出来让用户能登
-    const p = await this.probe();
+    const p = await this.probe(provider);
     if (p.loggedIn !== true) {
       if (this.config.hideWindow === true) await this.surfaceForLogin(provider);
       const err = new Error("LDW 页面未登录（跳到了登录页）。已把浏览器窗口叫到前台，请登录后重发。");
@@ -668,18 +723,61 @@ export class EdgeDriver {
       throw err;
     }
 
-    // 3) hook
+    // 3) 未适配回复捕获策略时禁止发送，避免消息发出后只能超时或误读页面文本。
+    if (provider?.id !== "deepseek" && provider?.replyCapture?.type !== "dom") {
+      throw new Error(`平台 ${provider?.name ?? provider?.id ?? "未知"} 尚未配置经过验证的回复捕获策略，暂不发送测试消息。`);
+    }
+    // 4) Hook 仅 DeepSeek 可用；其它站点按 provider 声明的 DOM 策略读取。
     await this.ensureHook(provider);
 
-    // 4) 基线：先读一次，记下现有回复条数
-    let baseline = 0;
-    try {
-      const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
-      baseline = typeof sc.count === "number" ? sc.count : 0;
-    } catch { /* 基线拿不到也不致命 */ }
+    // 4.5) 压缩 .txt 通道：job.file 存在 ⇒ 先上传附件、等解析完，prompt 已是短指令。
+    if (typeof job.file === "string" && job.file !== "") {
+      if (this.config.verboseLog) this.log.debug?.(`[edge-driver] .txt 通道：上传 ${job.file}`);
+      const up = await this.uploadFileToPage(job.file, 20000);
+      if (up.ok !== true) {
+        const err = new Error(`.txt 上传失败（${up.stage ?? "unknown"}）：${up.message ?? "未知"}`);
+        err.code = "WEBIN_COMPACTION_FILE_FAILED";
+        throw err;
+      }
+      // 等页面解析完成：附件文件名出现且「上传中/解析中/%」字样消失（上限 120s）。
+      const fileName = String(job.file).split(/[\\/]/).pop();
+      const waitExpr = `(() => {
+        var name = ${JSON.stringify(fileName)};
+        var deadline = Date.now() + 120000;
+        return new Promise(function (resolve) {
+          (function attempt() {
+            var text = "";
+            try { text = document.body.innerText || ""; } catch (e) {}
+            var hasName = text.indexOf(name) !== -1;
+            var uploading = /(上传中|解析中|正在上传|uploading|\\d+\\s*%)/i.test(text);
+            if (hasName && !uploading) { resolve(JSON.stringify({ ok: true })); return; }
+            if (Date.now() > deadline) { resolve(JSON.stringify({ ok: false, stage: 'parse-timeout', message: '等文件解析超时（120s）—— 附件名' + (hasName ? '已出现但仍在处理' : '从未出现，可能上传控件没接住文件') })); return; }
+            setTimeout(attempt, 800);
+          })();
+        });
+      })()`;
+      const waitRaw = await this.evalInPage(waitExpr, 130000);
+      const wait = JSON.parse(String(waitRaw));
+      if (wait.ok !== true) {
+        const err = new Error(`.txt 上传后解析未完成（${wait.stage ?? "unknown"}）：${wait.message ?? ""}`);
+        err.code = "WEBIN_COMPACTION_FILE_FAILED";
+        throw err;
+      }
+      if (this.config.verboseLog) this.log.debug?.("[edge-driver] 附件就绪，发送压缩指令");
+    }
 
-    // 5) 填字
-    const fill = JSON.parse(String(await this.evalInPage(buildFillScript(prompt), 20000)));
+    // 5) 基线：先读一次，记下现有回复条数（DeepSeek 专用 DOM 抓取）
+    let baseline = 0;
+    if (provider?.id === "deepseek") {
+      try {
+        const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
+        baseline = typeof sc.count === "number" ? sc.count : 0;
+      } catch { /* 基线拿不到也不致命 */ }
+    }
+
+    // 5) 填字：使用 provider 自己声明的输入选择器。
+    const fillHints = { inputSelectors: provider?.input?.selectors ?? [] };
+    const fill = JSON.parse(String(await this.evalInPage(buildFillScript(prompt, fillHints), 20000)));
     if (fill.ok !== true) {
       throw new Error(`填入输入框失败：${fill.message ?? fill.stage ?? "未知"}`);
     }
@@ -692,16 +790,22 @@ export class EdgeDriver {
     await sleep(delay);
 
     // 7) 点火
-    const trig = JSON.parse(String(await this.evalInPage(buildTriggerScript(undefined, prompt), 20000)));
+    const triggerHints = {
+      inputSelectors: provider?.input?.selectors ?? [],
+      sendSelectors: provider?.send?.selectors ?? [],
+      signatures: provider?.send?.signatures ?? [],
+      vetoes: provider?.send?.vetoes ?? [],
+    };
+    const trig = JSON.parse(String(await this.evalInPage(buildTriggerScript(triggerHints, prompt), 20000)));
     if (trig.ok !== true) {
       throw new Error(`点击发送失败：${trig.message ?? trig.stage ?? "未知"}`);
     }
 
     // 8) 等回复（主路径：hook 事件；兜底：DOM 抓取）
-    const result = await this.waitForReply(job, baseline);
+    const result = await this.waitForReply(job, baseline, provider);
 
     // 9) 清空输入框，为下一轮留干净状态
-    await this.evalInPage(buildClearInputScript(), 10000).catch(() => undefined);
+    await this.evalInPage(buildClearInputScript({ inputSelectors: provider?.input?.selectors ?? [] }), 10000).catch(() => undefined);
 
     /**
      * 10) 清掉本轮在网页版新建的废对话。
@@ -709,9 +813,9 @@ export class EdgeDriver {
      * ⚠️ 放在最后、且**失败不影响结果** —— 清理是锦上添花，
      * 绝不能因为它出错就把已经拿到的好回复丢掉。
      */
-    if (this.config.autoDeleteSessions === true) {
+    if (canDeleteSessions) {
       try {
-        const removed = await this.purgeNewSessions();
+        const removed = await this.purgeNewSessions(provider);
         if (removed > 0) this.log.info?.(`[edge-driver] 已清理 ${removed} 条网页版废对话`);
       } catch (e) {
         this.log.debug?.(`[edge-driver] 清理废对话失败（不影响本轮）: ${String(e?.message ?? e)}`);
@@ -764,7 +868,10 @@ export class EdgeDriver {
    * userToken）—— 这样才能带上完整的浏览器指纹与同源 cookie，
    * 与 webin「不自己伪造请求」的原则一致。
    */
-  async listSessions(maxPages = 10) {
+  async listSessions(provider = this.getProvider(this.platformId), maxPages = 10) {
+    if (provider?.sessionApi?.list !== true || typeof provider.sessionApi.listPath !== "string" || typeof provider.sessionApi.rowsPath !== "string") {
+      throw new Error(`平台 ${provider?.id ?? "?"} 没有经过验证的会话列表接口`);
+    }
     /**
      * ⚠️ 必须先确保在目标域里。
      *
@@ -774,20 +881,18 @@ export class EdgeDriver {
      */
     await this.ensureOnTargetDomain();
     const expr = `(async () => {
-      const raw = localStorage.getItem('userToken') || '{}';
-      let token = '';
-      try { token = JSON.parse(raw).value || ''; } catch (e) { token = ''; }
-      const H = { Authorization: 'Bearer ' + token, 'content-type': 'application/json' };
+      const cfg = ${JSON.stringify(provider.sessionApi)};
       const out = [];
-      for (let page = 1; page <= ${Number(maxPages) || 10}; page++) {
-        const r = await fetch('/api/v0/chat_session/fetch_page?count=50&page=' + page, { headers: H });
+      for (let page = 0; page < ${Number(maxPages) || 10}; page++) {
+        const u = cfg.listPath.replace('{page}', String(page + (cfg.pageBase || 0)));
+        const r = await fetch(u, { credentials: 'include' });
         if (!r.ok) break;
         const j = await r.json();
-        const bd = j && j.data ? j.data.biz_data : null;
-        const ss = bd && Array.isArray(bd.chat_sessions) ? bd.chat_sessions : [];
-        if (ss.length === 0) break;
-        for (const s of ss) out.push({ id: s.id, title: s.title, updatedAt: s.updated_at, pinned: s.pinned === true });
-        if (!bd || bd.has_more !== true) break;
+        const rows = cfg.rowsPath.split('.').reduce((v,k)=>v?.[k], j);
+        if (!Array.isArray(rows) || rows.length === 0) break;
+        for (const s of rows) out.push({ id: s[cfg.idField || 'id'], title: s[cfg.titleField || 'title'], pinned: s[cfg.pinnedField || 'pinned'] === true });
+        const more = cfg.morePath ? cfg.morePath.split('.').reduce((v,k)=>v?.[k], j) : false;
+        if (!more) break;
       }
       return JSON.stringify(out);
     })()`;
@@ -795,22 +900,17 @@ export class EdgeDriver {
     try { return JSON.parse(String(raw)); } catch { return []; }
   }
 
-  /** 删一条网页版对话。返回是否成功。 */
-  async deleteSession(sessionId) {
+  /** 删一条网页对话。只允许 provider 明确声明并配置经过验证的删除接口。 */
+  async deleteSession(sessionId, provider = this.getProvider(this.platformId)) {
     if (typeof sessionId !== "string" || sessionId === "") return false;
+    if (provider?.sessionApi?.delete !== true || typeof provider.sessionApi.deletePath !== "string") return false;
     await this.ensureOnTargetDomain();
     const expr = `(async () => {
-      const raw = localStorage.getItem('userToken') || '{}';
-      let token = '';
-      try { token = JSON.parse(raw).value || ''; } catch (e) { token = ''; }
-      const r = await fetch('/api/v0/chat_session/delete', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + token, 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_session_id: ${JSON.stringify(sessionId)} }),
-      });
+      const cfg = ${JSON.stringify(provider.sessionApi)};
+      const payload = { [cfg.idField || 'chat_session_id']: ${JSON.stringify(sessionId)} };
+      const r = await fetch(cfg.deletePath, { method: cfg.method || 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
       const j = await r.json().catch(() => ({}));
-      const bd = j && j.data ? j.data.biz_code : undefined;
-      return String(r.status === 200 && (bd === 0 || bd === undefined));
+      return String(r.ok && (j?.code === 0 || j?.data?.biz_code === 0 || j?.success === true));
     })()`;
     const ok = await this.evalInPage(expr, 30000).catch(() => false);
     return ok === true || ok === "true";
@@ -828,7 +928,7 @@ export class EdgeDriver {
    *
    * @returns 实际删掉的条数
    */
-  async purgeNewSessions() {
+  async purgeNewSessions(provider = this.getProvider(this.platformId)) {
     const before = this._sessionsBefore;
     this._sessionsBefore = null;
     if (!Array.isArray(before)) return 0;   // 没有基线 ⇒ 宁可不删，也不误删
@@ -836,14 +936,14 @@ export class EdgeDriver {
     /** 新建的对话可能要过一会儿才出现在列表里。 */
     await sleep(Math.max(0, this.config.sessionDeleteSettleMs));
 
-    const after = await this.listSessions();
+    const after = await this.listSessions(provider);
     if (!Array.isArray(after) || after.length === 0) return 0;
 
     const known = new Set(before.map((s) => s?.id).filter(Boolean));
     const fresh = after.filter((s) => s?.id && !known.has(s.id) && s.pinned !== true);
     let removed = 0;
     for (const s of fresh) {
-      const ok = await this.deleteSession(s.id);
+      const ok = await this.deleteSession(s.id, provider);
       if (ok) removed++;
       /** 一条一条来，别把接口打爆。 */
       await sleep(600);
@@ -852,7 +952,7 @@ export class EdgeDriver {
   }
 
   /** 轮询等回复：优先读 hook 事件队列，其次读 DOM。 */
-  async waitForReply(job, baseline) {
+  async waitForReply(job, baseline, provider = this.getProvider(this.platformId)) {
     const t0 = Date.now();
     const limit = this.config.replyTimeoutMs;
     let lastText = "";
@@ -876,32 +976,47 @@ export class EdgeDriver {
 
     while (Date.now() - t0 < limit) {
       if (this.stopping) {
-        // 被取消：按页面停止按钮，别再烧配额
-        await this.evalInPage(buildStopScript(), 10000).catch(() => undefined);
+        // 停止按钮同样是站点私有能力；只执行明确声明的选择器。
+        const stopSelector = provider?.send?.stopSelector;
+        if (typeof stopSelector === "string" && stopSelector !== "") {
+          const expr = `(() => { const e=document.querySelector(${JSON.stringify(stopSelector)}); if(!e||e.disabled||e.getAttribute('aria-disabled')==='true')return false; e.click(); return true })()`;
+          await this.evalInPage(expr, 10000).catch(() => false);
+        }
         throw new Error("任务已取消（用户停止）");
       }
       await sleep(1500);
 
       let drained = null;
-      try { drained = JSON.parse(String(await this.evalInPage(drainExpr, 15000))); } catch { /* 继续 */ }
+      let text = "";
+      let think = "";
+      let finished = false;
 
-      let text = drained?.text ?? "";
-      let think = drained?.think ?? "";
-      const finished = drained?.finished === true;
-
-      if (text === "") {
-        // hook 没抓到 → DOM 兜底
-        try {
-          const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
-          if (typeof sc.last === "string" && sc.last !== "") text = sc.last;
-          if (typeof sc.think === "string" && sc.think !== "") think = sc.think;
-        } catch { /* 忽略 */ }
+      if (provider?.id === "deepseek") {
+        try { drained = JSON.parse(String(await this.evalInPage(drainExpr, 15000))); } catch { /* 继续 */ }
+        text = drained?.text ?? "";
+        think = drained?.think ?? "";
+        finished = drained?.finished === true;
+        if (text === "") {
+          try {
+            const sc = JSON.parse(String(await this.evalInPage(buildScrapeScript(), 20000)));
+            if (typeof sc.last === "string" && sc.last !== "") text = sc.last;
+            if (typeof sc.think === "string" && sc.think !== "") think = sc.think;
+          } catch { /* 忽略 */ }
+        }
+      } else if (provider?.replyCapture?.type === "dom") {
+        const cfg = JSON.stringify(provider.replyCapture);
+        const expr = `(() => { const c=${cfg}; const vis=e=>!!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length)); const nodes=[]; for(const q of c.replySelectors||[]){try{for(const e of document.querySelectorAll(q))if(vis(e))nodes.push(e)}catch{}} const unique=[...new Set(nodes)]; const e=unique.at(-1); const text=e?String(e.innerText||e.textContent||'').trim():''; const stop=(c.stopSelectors||[]).some(q=>{try{return [...document.querySelectorAll(q)].some(vis)}catch{return false}}); return JSON.stringify({text,finished:text!==''&&!stop,via:'dom',url:location.href}) })()`;
+        try { drained = JSON.parse(String(await this.evalInPage(expr, 15000))); text = drained.text ?? ""; finished = drained.finished === true; } catch { /* 继续 */ }
       }
 
       const chatUrl = String(await this.evalInPage("location.href", 8000).catch(() => ""));
 
-      // 登录页守卫（照抄 webin 的判据）
-      if (/sign[_-]?in|sign[_-]?up|\/login/i.test(chatUrl)) {
+      // 登录页守卫：DeepSeek 旧判据按 URL；其它 provider 可声明登录页选择器。
+      const authUiSelector = provider?.authProbe?.loggedOutSelectors?.join(",") ?? "";
+      const isLoginUi = provider?.id === "deepseek"
+        ? /sign[_-]?in|sign[_-]?up|\/login/i.test(chatUrl)
+        : (authUiSelector !== "" && await this.evalInPage(`(() => { const q=${JSON.stringify(authUiSelector)}; try{return [...document.querySelectorAll(q)].some(e=>e.offsetWidth||e.offsetHeight)}catch{return false} })()`, 5000).catch(() => false)) === true;
+      if (isLoginUi) {
         const err = new Error(`LDW 页面已掉线到登录页（${chatUrl}），本轮回复不可信。`);
         err.code = "WEBIN_NOT_LOGGED_IN";
         throw err;
@@ -915,6 +1030,10 @@ export class EdgeDriver {
         }
       } else {
         stable = 0;
+      }
+      if (provider?.id !== "deepseek" && drained?.via === "dom" && text !== "" && text === lastText && finished === true) {
+        stable++;
+        if (stable >= 3) return { text, think: think || lastThink, status: "finished", chatUrl, via: "dom" };
       }
       if (text !== "" && text === lastText && waited > 15000 && finished !== false) {
         stable++;
