@@ -1,0 +1,56 @@
+{
+  "name": "dsh-webin-edge-driver",
+  "version": "1.0.0",
+  "description": "DSH 插件：用 CDP 驱动本机真 Edge 跑网页版 AI（DeepSeek / 元宝 / 千问 / 豆包 / 自定义），LDW 模型提供方。含登录态 cookie 判据、统一 Token/Cookie 凭据文件、粘贴凭据登录、会话惰性回收。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "provider.example.json",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EvelynShiao/dsh-webin-edge-driver.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EvelynShiao/dsh-webin-edge-driver/issues"
+  },
+  "homepage": "https://github.com/EvelynShiao/dsh-webin-edge-driver#readme",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "edge",
+    "cdp",
+    "yuanbao",
+    "qwen",
+    "doubao"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.11.0"
+  }
+}

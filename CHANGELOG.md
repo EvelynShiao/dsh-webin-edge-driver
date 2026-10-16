@@ -1,5 +1,75 @@
 # Changelog
 
+## 2026-10-16 · 改成完整插件包（弃补丁路线）+ 会话惰性回收
+
+### 重大结构变更：`patch/` → `lib/`，本仓库变成**可直接安装的插件**
+
+**触发原因**：用户手机装本插件被拒，报「缺少 package.json 中的 dsh.bundle.patch」。
+
+**根因**：本仓库原本是**打补丁脚本仓库**（`install.ps1` + `patch/`），
+给已经装了 dsh-webin 的机器用；它**没有 `package.json`**。
+而 DSH 判定「这是不是插件」看的是 `package.json` 的 `dsh.bundle.patch`
+（指向 `cordis.patch.yml`）。手机上跑不了 PowerShell，只能走插件安装，
+于是必然被拒。
+
+**改法**（用户指示「不要补丁，我们就用完整结构」）：
+
+- 新增 `lib/`（7 个文件的**完整实现**，单一真相源，内容与真机已装版本**逐一哈希一致**）
+- 新增 `package.json`：`main` / `exports` / `files` / **`dsh.bundle.patch`** / `dsh.client`
+- 新增 `cordis.patch.yml`：`- insert: [{id: dsh-webin-edge-driver, name: ...}]`
+- 删除 `patch/`（含 `extract-scripts.mjs` —— 完整结构下不再需要从上游抠脚本）
+- `install.ps1` 重写：从「打补丁」变成「用 lib/ 覆盖已装插件」（并整目录备份）
+- `INSTALL.md` 重写：三种安装方式 + 7 个必需文件清单 + 「别和上游同时启用」
+
+**验证**（不是推测）：
+
+- `package.json` JSON 合法，`dsh.bundle.patch` → 文件真实存在
+- `cordis.patch.yml` 用真 YAML 解析器解析通过，形状 `- insert: [{id,name}]` 正确
+- **包入口冒烟测试**：`import lib/index.js` 成功，导出 `apply, inject, name`
+  （即所有本地 import 都解析到了 —— 这是「装上不会崩」的关键证据）
+- 7 个文件与已装版本逐一 SHA256 一致
+
+⚠️ 本包与上游 `dsh-webin` **不能同时启用**：都会注册同一批 LDW 路由。
+
+### 新增：会话惰性回收（`lib/session-gc.js`）
+
+用户原话：「会话用完了马上删不好，容易被看出来是机器人，建议做个自定义的
+多少分钟后删除 / 多少机器人产生会话后删除。」这个直觉是对的 —— 来一条消息就
+精准地多一条对话、旋即消失，是很好认的机器特征。
+
+| `sessionDeleteMode` | 行为 |
+|---|---|
+| `never` | 不删（最保守） |
+| `immediate` | 老行为，本轮结束立刻删（最像机器人） |
+| `delay` | 记进账本，`sessionDeleteDelayMinutes` 分钟后才删（默认 30） |
+| `count` | 记进账本，攒到 `sessionDeleteMaxSessions` 个后删最老的（默认 20） |
+
+留空 ⇒ 回落到旧的布尔 `autoDeleteSessions`，**老配置行为完全不变**。
+
+**三个设计要点**
+
+1. **只碰机器人自己建的会话**：用一份持久化账本记下「哪些是这轮新建的」，
+   之后所有删除都只在这个范围内。绝不做「删最近 N 条」（那会误删用户历史）。
+2. **惰性 GC，不新开定时器**：删除必须借浏览器（会话列表/删除都是页面里
+   fetch），用户又对常驻进程敏感 ⇒ **搭车**：复用每次任务结束时页面已开、
+   且刚验证过登录的时刻顺手清算。代价是「没新任务就到期的会一直等」，
+   这是刻意的偏向 —— 少删几条对话比多养一个常驻进程好，而且「不急着删」本身更像真人。
+3. **账本持久化**（`~/.dsh/webin/pending-session-deletes.json`，原子写）：
+   否则重启后「N 分钟后删」就变成永远不删。按 `平台#槽位` 隔离，避免串号。
+   删除失败的条目**留在账本里**下次重试，不因一次网络抖动永久漏一条。
+
+**测试抓到的真 bug**：`never` 模式下 `collectNewSessions` 仍会记账。
+生产路径虽被 `canManageSessions` 挡住，但方法**被单独调用**时就会自相矛盾
+（`never` 却往待删账本写东西）。已在方法内部加模式守卫 —— 安全的东西要在
+**最靠近数据的地方**再确认一次。集成测试（假 provider + 假接口）全绿。
+
+### 配置
+
+`~/.dsh/webin/config.json` 的 `edgeDriver` 块新增
+`sessionDeleteMode: "delay"` / `sessionDeleteDelayMinutes: 30` /
+`sessionDeleteMaxSessions: 20`；`sessionDeleteMode` 有**白名单校验**
+（拼错会报 problem 而不是静默回落到 never）。
+
 ## 2026-10-16 · 粘贴 Token/Cookie 直接登录（`/credentials/inject`）
 
 **用户点名要的能力**：不必开浏览器扫码，把 Token/Cookie 灌进去就登 ——

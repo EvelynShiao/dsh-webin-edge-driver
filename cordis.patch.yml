@@ -1,0 +1,13 @@
+# dsh bundle patch：把本插件插进 profile 的层栈。
+#
+# ⚠️ 这就是 `package.json` 里 `dsh.bundle.patch` 指向的文件 ——
+#    缺了它，DSH 安装时会报「缺少 package.json 中的 dsh.bundle.patch」。
+#
+# `id`   = 本插件在运行时的实例 id（日志、/status 里能看到）
+# `name` = 要加载的**模块名**（DSH 按包名解析）
+#
+# ⚠️ 与 dsh-webin（上游）**不要同时启用**：两者都会注册 LDW 模型路由
+#    （webin-deepseek 等），同时开会撞车。二选一。
+- insert:
+    - id: dsh-webin-edge-driver
+      name: 'dsh-webin-edge-driver'

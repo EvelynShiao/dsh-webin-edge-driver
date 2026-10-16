@@ -1,235 +1,97 @@
-# 手动安装（`install.ps1` 不适用时）
+# 安装
 
-`install.ps1` 能自动打补丁，但它靠「锚点字符串」定位。如果你的 `dsh-webin`
-版本跟 0.2.23 差得多、锚点对不上，就按本文手动改。
+本仓库是**完整插件包**（不是补丁集）。`lib/` 就是能直接跑的完整实现。
 
-**一共只改 4 处，`lib/index.js` 原有逻辑一行不动。**
+## 方式一：用 DSH 的插件机制（推荐，手机/电脑通用）
+
+```bash
+dsh plugin add dsh-webin-edge-driver
+```
+
+或直接从 git 装：
+
+```bash
+dsh plugin add https://github.com/EvelynShiao/dsh-webin-edge-driver.git
+```
+
+DSH 会读 `package.json` 里的 `dsh.bundle.patch`（→ `cordis.patch.yml`），
+把插件插进 profile 的层栈。
+
+**这就是「缺少 dsh.bundle.patch」那个报错的出处** —— 之前本仓库只有
+`install.ps1` + `patch/`、**没有 `package.json`**，所以 DSH 压根不认为它是插件。
+2026-10-16 起已改成完整包结构。
+
+## 方式二：本地覆盖安装（只在电脑上有用）
+
+已经装了 `dsh-webin`，想把手改的 `lib/` 直接盖上：
+
+```powershell
+.\install.ps1                 # 备份 + 覆盖 lib/
+.\install.ps1 -RestartDsh     # 顺便结束 DSH 进程，然后你手动重启
+```
+
+它会先整目录备份到 `<插件目录>.bak-<时间戳>`，想回退盖回去就行。
+
+## 方式三：手动复制
+
+把 `lib/` 里的 7 个文件覆盖到：
+
+```
+%LOCALAPPDATA%\DeepSeekHarness\.dsh\profiles\web\node_modules\dsh-webin\lib\
+```
+
+再把 `provider.example.json` 放到插件根目录。
 
 ---
 
-## 0. 放文件
+## 必须的 7 个文件
 
-```
-<插件目录>/lib/edge-driver.js           ← 新增
-<插件目录>/lib/edge-driver-scripts.js   ← 新增
-```
+缺任何一个，插件**加载即崩**（`import` 解析失败，所有 provider 都不注册）：
 
----
+| 文件 | 作用 |
+|---|---|
+| `index.js` | 插件入口（host 半）：provider 注册、HTTP 接口、登录门禁 |
+| `client.js` | 界面半：LDW 设置页、模型选择器 UI |
+| `edge-driver.js` | CDP 驱动本机真 Edge：填字、发送、抓回复、凭据注入 |
+| `edge-driver-scripts.js` | 注入页面里的原生 DOM 脚本（逐字提取自上游，未改写） |
+| `login-cookie-probe.js` | 直读 Edge profile 的 cookie 判登录态（零依赖，不起浏览器） |
+| `credential-store.js` | 统一 Token/Cookie 凭据文件（手机+电脑共用一份） |
+| `session-gc.js` | 会话惰性回收账本（N 分钟后删 / 攒够 M 个删） |
 
-## 1. 加 import
+## 依赖
 
-文件顶部（`import { homedir } from "node:os";` 那一片的末尾）加一行：
+- **Node.js** `^22.18.0 || >=24.11.0`
+  （`credential-store.js` / `login-cookie-probe.js` 用内置 `node:sqlite`，**无需任何 npm 依赖**）
+- **Microsoft Edge**：Windows 默认路径会自动探测；也可在
+  `config.json` 的 `edgeDriver.executable` 指定
+- 无第三方运行时依赖
 
-```js
-import { EdgeDriver, EDGE_DRIVER_DEFAULTS } from "./edge-driver.js";
-```
+## ⚠️ 别和上游 dsh-webin 同时启用
 
----
+两者都会注册同一批 LDW 模型路由（`webin-deepseek` / `webin-yuanbao` …），
+同时开会撞车。**二选一**。
 
-## 2. `checkConfig()` 里加归一化
+## 装完要做的
 
-找到 `return { ok: problems.length === 0, config: out, problems };`
-（在 `checkConfig` 函数末尾），在它**之前**插一行：
+1. **重启 DSH**（host 半的改动必须重启才生效，热重载不一定覆盖）
+2. 打开设置页的 LDW 分组，确认平台与登录态
+3. 需要登录时：扫码登录一次，或者用凭据接口直接注入（见 README）
 
-```js
-out.edgeDriver = normalizeEdgeDriverConfig(src.edgeDriver, problems);
-```
+## 配置
 
-然后把这个函数贴到 `checkConfig` 后面：
+插件配置在 `~/.dsh/webin/config.json`，`edgeDriver` 块常用项：
 
-```js
-function normalizeEdgeDriverConfig(raw, problems) {
-    const out = { ...EDGE_DRIVER_DEFAULTS };
-    if (raw === void 0 || raw === null) return out;
-    if (typeof raw !== "object") {
-        problems.push({ field: "edgeDriver", reason: `应为对象，收到 ${typeof raw}`, fellBackTo: "默认值" });
-        return out;
-    }
-    for (const key of Object.keys(EDGE_DRIVER_DEFAULTS)) {
-        const value = raw[key];
-        if (value === void 0) continue;
-        const fallback = EDGE_DRIVER_DEFAULTS[key];
-        if (typeof fallback === "boolean") {
-            if (typeof value === "boolean") out[key] = value;
-            else problems.push({ field: `edgeDriver.${key}`, reason: `应为布尔，收到 ${typeof value}`, fellBackTo: fallback });
-            continue;
-        }
-        if (typeof fallback === "string") {
-            if (typeof value === "string") out[key] = value;
-            else problems.push({ field: `edgeDriver.${key}`, reason: `应为字符串，收到 ${typeof value}`, fellBackTo: fallback });
-            continue;
-        }
-        const num = typeof value === "number" ? value : Number(value);
-        if (!Number.isFinite(num) || num < 0) {
-            problems.push({ field: `edgeDriver.${key}`, reason: `不是有效非负数字`, fellBackTo: fallback });
-            continue;
-        }
-        out[key] = Math.round(num);
-    }
-    if (out.port < 1024 || out.port > 65535) {
-        problems.push({ field: "edgeDriver.port", reason: `${out.port} 不是合法端口`, fellBackTo: EDGE_DRIVER_DEFAULTS.port });
-        out.port = EDGE_DRIVER_DEFAULTS.port;
-    }
-    if (out.sendDelayMinMs > out.sendDelayMaxMs) {
-        const t = out.sendDelayMinMs;
-        out.sendDelayMinMs = out.sendDelayMaxMs;
-        out.sendDelayMaxMs = t;
-    }
-    return out;
+```json
+{
+  "edgeDriver": {
+    "enabled": true,
+    "hideWindow": true,
+    "sessionDeleteMode": "delay",
+    "sessionDeleteDelayMinutes": 30,
+    "sessionDeleteMaxSessions": 20
+  }
 }
 ```
 
----
-
-## 3. `apply()` 里建实例 + 领活循环
-
-找到 `const adapter = createAdapter({` 那一行，在它**之前**插入整段
-（约 120 行）：
-
-```js
-const edgeDriver = new EdgeDriver({
-    config: { ...EDGE_DRIVER_DEFAULTS, ...readConfig().config.edgeDriver ?? {} },
-    log,
-    getProvider: (id) => registry.get(id),
-});
-edgeDriver.platformId = DEFAULT_PROVIDER_ID;
-
-/** 驱动器自己发心跳 —— 否则看门狗会认为「面板失联」误杀长任务。 */
-const EDGE_DRIVER_CLIENT_ID = "edge-driver";
-ctx.effect(() => {
-    const beat = () => {
-        if (edgeDriver.proc === null) return;
-        beats.set(EDGE_DRIVER_CLIENT_ID, {
-            clientId: EDGE_DRIVER_CLIENT_ID,
-            platform: edgeDriver.platformId,
-            at: Date.now(),
-            loggedIn: edgeDriver.lastProbeLoggedIn === true,
-            hasGuest: true,
-            replyCount: edgeDriver.stats.done,
-        });
-    };
-    beat();
-    const timer = setInterval(beat, 5e3);
-    return () => { clearInterval(timer); beats.delete(EDGE_DRIVER_CLIENT_ID); };
-}, "dsh-webin: edge-driver heartbeat");
-
-/** 领活循环。队列空时**完全不碰 Edge**（省内存）。 */
-ctx.effect(() => {
-    if (edgeDriver.config.enabled !== true) {
-        log.info?.("edge-driver 未启用（edgeDriver.enabled = false）");
-        return;
-    }
-    const tick = async () => {
-        if (edgeDriver.busy === true || edgeDriver.stopping === true) return;
-        try {
-            // 多平台：从队列读出真正待领的平台，逐个处理（串行）
-            const pendingPlatforms = [...new Set(
-                queue.inspect().filter((j) => j.state === "pending").map((j) => j.platform).filter(Boolean)
-            )];
-            if (pendingPlatforms.length === 0) return;
-
-            for (const platformId of pendingPlatforms) {
-                if (edgeDriver.busy === true || edgeDriver.stopping === true) break;
-                if (!queue.inspect().some((j) => j.state === "pending" && j.platform === platformId)) continue;
-
-                try {
-                    await edgeDriver.ensureEdge(platformId);
-                } catch (e) {
-                    log.warn?.(`edge-driver 平台 ${platformId} 起不来: ${String(e?.message ?? e)}`);
-                    continue;
-                }
-
-                const job = queue.claimNext(platformId, void 0);
-                if (job === void 0) continue;
-                edgeDriver.busy = true;
-                edgeDriver.pending = { jobId: job.id, startedAt: Date.now() };
-                edgeDriver.stats.claimed++;
-                log.info?.(`edge-driver 领到任务 ${job.id}（平台 ${platformId}）`);
-                try {
-                    const provider = registry.get(job.platform ?? platformId);
-                    const r = await edgeDriver.runJob(job, provider);
-                    edgeDriver.lastProbeLoggedIn = true;
-                    queue.settle(job.id, {
-                        text: r.text, think: r.think, status: r.status,
-                        ...r.chatUrl === "" ? {} : { chatUrl: r.chatUrl }
-                    });
-                    edgeDriver.stats.done++;
-                    log.info?.(`edge-driver 任务 ${job.id} 完成（${r.text.length} 字符，via ${r.via}）`);
-                    // 顺手写登录态快照（host 靠它判断「登录过」）
-                    try {
-                        const snap = await edgeDriver.snapshot();
-                        if (typeof snap === "string" && snap.trim() !== "" && snap.trim() !== "{}") {
-                            await writeAtomic(snapshotPath(job.platform ?? platformId), snap);
-                        }
-                    } catch (e) {
-                        log.debug?.(`edge-driver 写快照失败（不影响本轮）: ${String(e?.message ?? e)}`);
-                    }
-                } catch (e) {
-                    edgeDriver.stats.failed++;
-                    const msg = String(e?.message ?? e);
-                    log.warn?.(`edge-driver 任务 ${job.id} 失败: ${msg}`);
-                    queue.settle(job.id, { error: msg });
-                } finally {
-                    edgeDriver.busy = false;
-                    edgeDriver.pending = null;
-                    edgeDriver.lastJobAt = Date.now();
-                    const gap = 800 + Math.floor(Math.random() * 1200);
-                    await new Promise((r) => setTimeout(r, gap));
-                }
-            }
-            edgeDriver.touchIdle();
-        } catch (e) {
-            if (edgeDriver.config.verboseLog) log.debug?.(`edge-driver 循环异常: ${String(e?.message ?? e)}`);
-        }
-    };
-    const timer = setInterval(() => void tick(), Math.max(500, edgeDriver.config.pollIntervalMs));
-    void tick();
-    return () => {
-        clearInterval(timer);
-        edgeDriver.stopLoop();
-        void edgeDriver.shutdownEdge("插件卸载");
-    };
-}, "dsh-webin: edge-driver loop");
-```
-
----
-
-## 4. `/status` 里暴露状态
-
-找到：
-
-```js
-if (method === "GET" && pathname === `${API_PREFIX}/status`) {
-    const clients = liveClients();
-    sendJson(res, 200, {
-        ok: true,
-        plugin: name,
-```
-
-在 `plugin: name,` 后面加一行：
-
-```js
-        edgeDriver: edgeDriver.status(),
-```
-
----
-
-## 5. 配置
-
-`<DSH_HOME>/webin/config.json` 加 `edgeDriver` 块（见 README 的「配置」节）。
-
----
-
-## 6. 重启 DSH
-
-改完必须重启（或插件热重载）才生效。
-
-**验证：**
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:3080/dsh-webin/api/status |
-    Select-Object -ExpandProperty edgeDriver | ConvertTo-Json
-```
-
-看到 `enabled: true` / `running: false` 就对了（`running: false` 表示
-「平时不跑」，正是你要的省内存状态）。
+`sessionDeleteMode` 可取 `never` / `immediate` / `delay` / `count`；
+留空则回落到旧的布尔 `autoDeleteSessions`（**老配置行为完全不变**）。
