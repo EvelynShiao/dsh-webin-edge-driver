@@ -111,26 +111,18 @@ for (let i = 1; i <= 8; i++) {
   console.log(`  [${i}] ${String(s).replace(/\s+/g, " ")}`);
 }
 
-console.log("\n=== ④ 所有包含「斑马」的容器（不过滤提问，看全貌）===");
-console.log(await evalIn(`(() => {
-  const vis=(e)=>!!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length));
-  const res=[],seen=new Set();
-  for (const e of [...document.querySelectorAll('div,section,article,li,p')].filter(vis)) {
-    const t=(e.innerText||'').trim();
-    if(!t.includes('斑马')) continue;
-    if(t.length>1200) continue;
-    const hasInnerChild=[...e.children].some(c=>{
-      const ct=(c.innerText||'').trim();
-      return ct.includes('斑马') && !ct.includes('为什么');
-    });
-    const k=String(e.className).slice(0,70)+'#'+e.tagName;
-    if(seen.has(k)) continue; seen.add(k);
-    res.push({tag:e.tagName,cls:String(e.className||'').slice(0,100),testid:e.getAttribute('data-testid'),
-              isInner:!hasInnerChild,len:t.length,text:t.slice(0,60).replace(/\\n/g,' ')});
-    if(res.length>=16) break;
-  }
-  return JSON.stringify(res,null,1);
-})()`));
+console.log("\n=== ④ 各候选「取最后一个」的文本（驱动就是这么取）===");
+console.log(await evalIn("(() => {" +
+  "const vis=(e)=>!!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length));" +
+  "const sels=['[class*=\"answer\"]','[class*=\"markdown\"]','[class*=\"message-list\"]','[class*=\"bubble\"]','[class*=\"chat-message\"]','[class*=\"content\"]','[class*=\"msg\"]'];" +
+  "const out={};" +
+  "for (const s of sels) {" +
+  "  const n=[...document.querySelectorAll(s)].filter(vis);" +
+  "  const e=n.at(-1);" +
+  "  out[s]= n.length===0 ? '(0 命中)' : String(e.innerText||e.textContent||'').trim().slice(0,80).replace(/\\n/g,' ');" +
+  "}" +
+  "return JSON.stringify(out,null,1);" +
+  "})()"));
 
 console.log("\n=== ⑤ 聊天区骨架（找滚动容器与「消息」层）===");
 console.log(await evalIn(`(() => {
