@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-10-16 · 真机验证：cookie 持久化修复**确认生效**
+
+上一节的两个修复，重启后实测通过。
+
+**证据一：注入的 cookie 全是持久 cookie**（问浏览器自己要的属性，最权威）
+
+```
+Network.getCookies → 5 条，全部 session:false
+  ds_session_id / .thumbcache_* / smidV2 / HWWAFSESID / HWWAFSESTIME
+  → 2027-04-14 到期（180 天后）
+```
+
+**证据二：关掉浏览器后 cookie 仍在磁盘上**
+
+```
+Browser.close 优雅关闭 → 残留进程 0 → -wal 已空（刷盘完成）
+Cookies: 28672 bytes，deepseek 域 cookie 数 = 5 条（全在）
+探针（走 cookie 判据，不再依赖快照）：
+  deepseek#default  loggedIn=true  reason=cookie  cookie=ds_session_id
+  deepseek#验证号    loggedIn=true  reason=cookie  cookie=ds_session_id
+```
+
+**⚠️ 一个测试方法上的坑（值得记下来）**
+
+第一次验证时用 `Stop-Process -Force` **强杀** Edge，磁盘上得到 **0 条 cookie**，
+差点误判成「修复没生效」。真实原因是：**Chromium 被强杀时不会刷盘**，
+cookie 还留在内存/未提交的 WAL 里。
+
+正确做法有两条，都比强杀可靠：
+1. 让它**优雅退出**（`Browser.close`，或等插件的空闲关停），再读磁盘；
+2. **直接问浏览器自己要属性** —— 不依赖刷盘时机，最可靠。
+
+**新增** `scripts/check-cookie-persistence.mjs`：把这条诊断固化下来。
+它调一次注入、连 CDP 读 `Network.getCookies`、逐条报告 `session` 属性，
+最后优雅关闭 —— 以后怀疑 cookie 没落盘就跑它。
+
+**清理**：测试用的槽位与 profile 目录（`验证号` / `测试B` / `second`，共约 231 MB）
+与测试快照都已删除；`auth/` 恢复为 `deepseek.json` + `default.json`。
+
 ## 2026-10-16 · 修「粘贴登录」两个致命问题 + 账号管理 CLI
 
 ### 问题一：注入的 cookie 是**会话 cookie**，浏览器一关登录态就没了
