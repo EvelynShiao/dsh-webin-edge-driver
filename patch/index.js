@@ -4315,14 +4315,39 @@ async function apply(ctx) {
 				const accounts = cfg.accounts ?? {};
 				const platforms = registry.all().map((p) => {
 					const entry = accountsForPlatform(accounts, p.id);
-					/** 逐槽位查登录快照（default 走旧文件名，其余 `平台#槽位`）。 */
+					/**
+					 * 逐槽位查登录态。
+					 *
+					 * ## 两条判据（2026-10-16 修）
+					 *
+					 * 原来只看**快照文件**，于是出现「明明登录了，设置页却显示未登录」——
+					 * 因为快照只在任务跑通后才写，而门禁不让未登录的任务入队 ⇒ 死锁。
+					 *
+					 * 现在与 `isPlatformLoggedIn` 保持一致：快照 **或** cookie 任一命中即算登录。
+					 * cookie 判据按**该槽位自己的 profile 目录**查，所以多账号之间不会串。
+					 */
 					const slotStatus = entry.slots.map((slot) => {
 						let loggedIn = false;
+						let via = "";
+						let cookie = "";
 						try {
 							const path = snapshotPath(slotNameFor(p.id, slot));
-							loggedIn = existsSync(path) && snapshotTextLooksLoggedIn(readFileSync(path, "utf8"));
+							if (existsSync(path) && snapshotTextLooksLoggedIn(readFileSync(path, "utf8"))) {
+								loggedIn = true;
+								via = "snapshot";
+							}
 						} catch {}
-						return { slot, loggedIn };
+						if (!loggedIn) {
+							try {
+								const probe = isLoggedInByCookies(p.id, edgeProfileDirFor(p.id, slot));
+								if (probe.loggedIn === true) {
+									loggedIn = true;
+									via = "cookie";
+									cookie = probe.cookie ?? "";
+								}
+							} catch {}
+						}
+						return { slot, loggedIn, via, ...cookie === "" ? {} : { cookie } };
 					});
 					return {
 						platform: p.id,

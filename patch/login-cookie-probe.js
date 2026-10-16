@@ -41,9 +41,11 @@
  * 阈值取 20 字节：既排除「空值/占位」，又不会因为 cookie 变短而误判。
  * 每个平台配**多个候选名**（任一命中即算登录），防止单一 cookie 改名就失效。
  */
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 
 /**
  * `node:sqlite` 是 Node 22+ 内置模块，**无需任何依赖**。
@@ -94,10 +96,37 @@ const MIN_CIPHER_BYTES = 20;
 export function readProfileCookies(profileDir) {
   const file = join(profileDir, "Default", "Network", "Cookies");
   if (!existsSync(file)) return null;
-  let db;
+  /**
+   * ① 首选：直接只读打开（不碰用户数据）。
+   *
+   * ② 回退：**复制到缓存目录再读**。
+   *
+   * 为什么需要回退（2026-10-16 真机踩到）：Chromium 的 cookie 库是 **WAL 模式**，
+   * 「只读打开一个带 WAL 的库」要求 `-shm` 存在且可写。Edge 正开着时这个前提
+   * **时好时坏** —— 实测同一个千问 profile：手工试能读（27 条），插件跑的时候
+   * 报 `unable to open database file`。判据因此偶发失效，表现是「登录态忽好忽坏」，
+   * 比稳定失败更难查。
+   *
+   * 复制一份再读就绕开所有锁：副本是自己的，随便写（SQLite 可自由重建 `-shm`），
+   * 也绝不碰用户的真实登录数据。
+   */
+  const direct = tryReadDb(file, true);
+  if (direct !== null) return direct;
+  return readViaCopy(profileDir, file);
+}
+
+/**
+ * 打开并读一张 cookie 表。失败返回 null（**不抛错**）。
+ *
+ * @param {string} file - Cookies 库路径
+ * @param {boolean} readOnly - true 用于原始库（绝不写用户数据）；
+ *                             false 用于临时副本（副本随便写，换最高兼容性）
+ */
+function tryReadDb(file, readOnly) {
+  let db = null;
   try {
     const { DatabaseSync } = require("node:sqlite");
-    db = new DatabaseSync(file, { readOnly: true });
+    db = new DatabaseSync(file, { readOnly });
     const rows = db
       .prepare("SELECT host_key AS host, name, length(encrypted_value) AS elen FROM cookies")
       .all();
@@ -105,7 +134,40 @@ export function readProfileCookies(profileDir) {
   } catch {
     return null;
   } finally {
-    try { db?.close(); } catch { /* 关不掉也不影响 */ }
+    /**
+     * ⚠️ **必须关**：忘了关有两个后果 ——
+     *   1. Windows 上文件被占住，删临时目录报 `EPERM`（实测踩过）
+     *   2. 句柄泄漏，反复调用会累积
+     */
+    try { db?.close(); } catch { /* 关不掉也不影响本次结果 */ }
+  }
+}
+
+/** 缓存目录：放 cookie 库的临时副本（固定在 DSH 数据目录下，体积极小、可重复覆盖）。 */
+function cookieCacheDir(profileDir) {
+  const home = process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  const tag = createHash("sha1").update(profileDir).digest("hex").slice(0, 12);
+  return join(home, "webin", "cache", "cookies", tag);
+}
+
+/**
+ * 复制 cookie 库（含 `-wal` / `-shm`）到缓存目录后读取。
+ *
+ * ⚠️ `-wal` 里可能有**尚未落盘的最新数据**（cookie 轮换往往就发生在那里），
+ * 所以三个文件必须一起复制 —— 只复制主库会读到过期快照。
+ */
+function readViaCopy(profileDir, file) {
+  const dir = cookieCacheDir(profileDir);
+  try {
+    mkdirSync(dir, { recursive: true });
+    for (const ext of ["", "-wal", "-shm"]) {
+      const src = file + ext;
+      if (existsSync(src)) copyFileSync(src, join(dir, "Cookies" + ext));
+    }
+    /** 副本用**读写**打开：能自由重建 -shm，兼容性最好（副本写坏无所谓）。 */
+    return tryReadDb(join(dir, "Cookies"), false);
+  } catch {
+    return null;
   }
 }
 
