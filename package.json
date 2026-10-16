@@ -15,11 +15,15 @@
   },
   "files": [
     "lib",
+    "scripts",
     "cordis.patch.yml",
     "provider.example.json",
     "README.md",
     "CHANGELOG.md"
   ],
+  "scripts": {
+    "verify": "node scripts/verify-package.mjs"
+  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
