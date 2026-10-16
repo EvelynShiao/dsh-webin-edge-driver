@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { EdgeDriver, EDGE_DRIVER_DEFAULTS } from "./edge-driver.js";
+import { isLoggedInByCookies } from "./login-cookie-probe.js";
 //#region src/shared/providers.ts
 /**
 * DeepSeek 网页版。
@@ -74,43 +75,176 @@ const BUILTIN_PROVIDERS = [DEEPSEEK, {
 	name: "LDW · 千问",
 	homeUrl: "https://www.qianwen.com/",
 	urlPattern: "qianwen\\.com",
-	input: { selectors: ["[data-chat-input-body] [contenteditable=\"true\"]", "[role=\"textbox\"]", "[contenteditable=\"true\"]"] },
-	send: { selectors: ["button[aria-label=\"发送消息\"]"], signatures: [], vetoes: ["添加附件"] },
-	authProbe: { type: "dom", loggedOutSelectors: ["button.lgU6iG_qrGuide"], loggedInSelectors: ["[data-chat-input-body] [contenteditable=\"true\"]", "button[aria-label=\"发送消息\"]"] },
+	/**
+	 * 输入框（2026-10-16 CDP 实测）：千问是 **Slate 编辑器**，
+	 * `div[data-slate-editor="true"]`，placeholder 走 `data-placeholder="向千问提问"`。
+	 * 旧的 `[data-chat-input-body]` 已经不存在了（页面改版），留着只会拖慢探测。
+	 */
+	input: { selectors: ["div[data-slate-editor=\"true\"]", "[contenteditable=\"true\"]", "[role=\"textbox\"]"] },
+	/**
+	 * 发送键（实测）：`button[aria-label="发送消息"]` —— 空输入时是 disabled，
+	 * 填字后才会启用（脚本里 `disabled()` 检查会自动跳过禁用态，安全）。
+	 *
+	 * 否决词是**保命网**：千问输入区附近实测有一堆陷阱按钮
+	 * （添加附件 / 录音纪要 / AI生视频 / AI生图 / 更多 / 工作助理…），
+	 * 几何兜底一旦误点「录音纪要」就开始录音。
+	 */
+	send: {
+		selectors: ["button[aria-label=\"发送消息\"]"],
+		signatures: [],
+		vetoes: ["添加附件", "上传", "语音", "录音", "麦克风", "深度思考", "联网", "停止", "stop", "生视频", "生图", "更多", "工作助理", "研究", "翻译", "代码", "写作"]
+	},
+	authProbe: { type: "dom", loggedOutSelectors: ["button.lgU6iG_qrGuide"], loggedInSelectors: ["div[data-slate-editor=\"true\"]", "button[aria-label=\"发送消息\"]"] },
 	replyCapture: { type: "dom", replySelectors: ["[data-message-role=\"assistant\"]", "[data-role=\"assistant\"]"], stopSelectors: ["button[aria-label*=\"停止\"]"] },
 	completionPath: "/api/v1/chat/completions",
 		adapterStatus: "pending-validation",
-	models: [],
+	/**
+	 * 模型清单：先只给**不声明思考开关**的一条（2026-10-16）。
+	 *
+	 * 为什么不直接给「快速 + 深度思考」两条：思考模式要在页面上拨开关，
+	 * 而千问的开关还没实测过 —— 声明了却拨不动，用户会看到「选了深度思考
+	 * 但没思考」的假象。等实测确认后再加第二条（格式照抄 DEEPSEEK）。
+	 */
+	models: [{
+		id: "qwen-fast",
+		name: "LDW · 千问（快速）",
+		description: "真实浏览器驱动千问网页版，不拨思考开关",
+		thinking: false
+	}],
 	contextWindow: 131072,
 	maxOutputTokens: 8192
   },
   {
     id: "yuanbao",
-    name: "LDW · 元宝（待验证）",
+    name: "LDW · 元宝",
     homeUrl: "https://yuanbao.tencent.com/",
     urlPattern: "yuanbao\\.tencent\\.com",
-    input: { selectors: ["div.ql-editor[contenteditable=\"true\"]", "[data-input-main-content] [contenteditable=\"true\"]"] },
-    send: { selectors: [], signatures: [], vetoes: [] },
+    /**
+     * 输入框（2026-10-16 CDP 实测）：Quill 编辑器 `div.ql-editor`，
+     * placeholder 走 `data-placeholder="发送消息"`。
+     */
+    input: { selectors: ["div.ql-editor[contenteditable=\"true\"]", "div.ql-editor", "[contenteditable=\"true\"]"] },
+    /**
+     * ## ⚠️ 发送键：强制 Enter（enterOnly）
+     *
+     * CDP 实测（2026-10-16）：元宝的发送键**不在输入框附近的 6 层 DOM 里**，
+     * 那个范围里全是陷阱按钮 —— 「添加」「切换模型」「AI 生图」「写作」
+     * 「解题」「深度研究」「PPT 生成」「数据分析」「更多」。
+     *
+     * 几何打分在这种页面上**必然误点**：点「PPT 生成」会切模式，
+     * 点「添加」会弹文件选择器，两个都是事故。
+     *
+     * 元宝是「Enter 发送」的交互，所以直接按 Enter —— 不收集任何按钮候选。
+     */
+    send: { selectors: [], signatures: [], vetoes: [], enterOnly: true },
     authProbe: { type: "dom", loggedOutSelectors: ["button.agent-dialogue__tool__login", ".hyc-phone-login__btn"], loggedInSelectors: ["div.ql-editor[contenteditable=\"true\"]"] },
-    replyCapture: { type: "dom", replySelectors: [], stopSelectors: [] },
+    /**
+     * ## 回复抓取（2026-10-16 CDP 实测补上）
+     *
+     * 之前是空数组 ⇒ `runJob` 的守卫直接拒绝发送
+     * （「发出去也读不到回复，因此暂不发送」）—— 登录修好后这就是最后一道墙。
+     *
+     * 实测（两轮对话，发「你好」+「1+1等于几」）：
+     *
+     *   - 助手回复的稳定容器是 `div.hyc-common-markdown`
+     *     （完整类名 `hyc-common-markdown hyc-common-markdown-style
+     *     hyc-common-markdown--hyperlink-underline ...`，后缀会变，所以只锚前缀）
+     *   - 节点数**随回复条数递增**：第 1 轮 1 个 → 第 2 轮 3 个 ✅
+     *   - 用户的提问**不在**这个容器里（第 1 轮只有 1 个节点，就是助手那条），
+     *     所以选择器天然只命中助手消息，不会把提问当成回复
+     *
+     * ⚠️ 元宝会**多答案并排**（第 2 轮实测出现两个 markdown：
+     * 「1+1 等于 2。」和「1+1 等于 2～ 😊」，还夹着
+     * `agent-chat__speech-text--multiple-answer-btn` 的「I prefer this answer」）。
+     * 抓取逻辑取 `unique.at(-1)`（最后一个），拿到的是最后一条答案 —— 可接受。
+     *
+     * ⚠️ `stopSelectors` 留空是**有意的**：元宝没有稳定的「停止生成」按钮，
+     * 硬填一个错的会让 `finished` 永远 false 而超时。空数组时 `finished`
+     * 退化为 `text !== ''`，配合「文本稳定 3 次」判定 —— 元宝是整段吐出的，
+     * 够用。
+     */
+    replyCapture: { type: "dom", replySelectors: ["div.hyc-common-markdown"], stopSelectors: [] },
     adapterStatus: "pending-validation",
     completionPath: "/",
-    models: [],
+    /** 同千问：先只给快速模式，思考开关实测后再加。 */
+    models: [{
+      id: "yuanbao-fast",
+      name: "LDW · 元宝（快速）",
+      description: "真实浏览器驱动腾讯元宝网页版",
+      thinking: false
+    }],
     contextWindow: 32768,
     maxOutputTokens: 8192,
   },
   {
     id: "doubao",
-    name: "LDW · 豆包（待验证）",
+    name: "LDW · 豆包",
     homeUrl: "https://www.doubao.com/chat/",
     urlPattern: "(^|\\.)doubao\\.com$",
-    input: { selectors: ["textarea[placeholder*=\"发消息\"]", "div.tiptap[contenteditable=\"true\"]"] },
-    send: { selectors: [], signatures: [], vetoes: [] },
-    authProbe: { type: "dom", loggedOutSelectors: ["button[class*=\"login\"]"], loggedInSelectors: ["textarea[placeholder*=\"发消息\"]"] },
-    replyCapture: { type: "dom", replySelectors: [], stopSelectors: [] },
+    /**
+     * 输入框（2026-10-16 CDP 实测，**已改版**）。
+     *
+     * 旧配置写的 `textarea[data-testid="chat_input_input"]` **在现网已不存在**
+     * （实测 `querySelector` 返回 null，直接导致发不出去）。
+     * 现在真正的输入框是 **tiptap / ProseMirror 富文本层**：
+     *
+     *   `div.tiptap.ProseMirror[contenteditable="true"]`（实测 740×24、可见）
+     *
+     * 所以把 tiptap 放到**第一位**（首选），旧的 textarea 选择器降级保留作兜底
+     * —— 万一豆包回滚版本，还能接住。
+     */
+    input: { selectors: ["div.tiptap.ProseMirror[contenteditable=\"true\"]", "div.ProseMirror[contenteditable=\"true\"]", "textarea[data-testid=\"chat_input_input\"]", "div.tiptap[contenteditable=\"true\"]"] },
+    /**
+     * ## ⚠️ 发送键：强制 Enter（enterOnly）
+     *
+     * CDP 实测：豆包输入框附近 6 层内**没有发送键**，全是陷阱 ——
+     * `upload_file_button`（上传）、`skill_bar_button_*`（PPT 生成 / 图像生成 /
+     * 帮我写作 / 视频生成 / 录音转写 / 音乐生成）、`chat_input_action_mode`（对话）、
+     * `chat_input_action_model`（豆包 快速）。
+     *
+     * 几何打分点中 `录音转写` 会开始录音、点 `upload_file_button` 会弹文件框，
+     * 所以直接按 Enter，不碰按钮。
+     */
+    send: { selectors: [], signatures: [], vetoes: [], enterOnly: true },
+    /**
+     * 登录探针（2026-10-16 实测修正）。
+     *
+     * `loggedInSelectors` 原来写的是 `textarea[data-testid="chat_input_input"]`
+     * —— 那个元素**已随改版消失**，于是**登录着也会被判成未登录**。
+     * 换成实测存在的 tiptap 输入层。
+     */
+    authProbe: { type: "dom", loggedOutSelectors: ["button[class*=\"login\"]"], loggedInSelectors: ["div.tiptap.ProseMirror[contenteditable=\"true\"]", "div.ProseMirror[contenteditable=\"true\"]", "textarea[data-testid=\"chat_input_input\"]"] },
+    /**
+     * ## 回复抓取（2026-10-16 CDP 实测补上）
+     *
+     * 之前是空数组 ⇒ `runJob` 守卫直接拒发。
+     *
+     * 实测（发「斑马为什么有条纹」「企鹅会飞吗」两轮）：
+     *
+     *   - 助手回复容器是 `div.md-box-root`（**类名带哈希后缀**，
+     *     完整是 `container-qX9Csx md-box-root`，哈希每次构建都变，
+     *     所以只锚**稳定前缀** `md-box`）
+     *   - 计数实测 = 2：用户消息 1 个 + 助手回复 1 个
+     *   - 取 `at(-1)`（最后一个）正好是助手回复，实测文本
+     *     「企鹅不会飞。它们的翅膀已经演化成短而硬的鳍状肢…」✅
+     *
+     * ⚠️ 为什么不用 `v_list_row`（也是 4 个可见节点）：那个类名下面
+     * 「最后一个」实测**取到空文本**（滚动容器的虚拟行），不可靠。
+     *
+     * ⚠️ `stopSelectors` 留空是有意的 —— 豆包没有稳定的「停止生成」按钮，
+     * 乱填会让 `finished` 永远 false。空数组时退化为「文本稳定 3 次」判定，
+     * 实测豆包是整段吐出的，够用。
+     */
+    replyCapture: { type: "dom", replySelectors: ["[class*=\"md-box\"]"], stopSelectors: [] },
     adapterStatus: "pending-validation",
     completionPath: "/",
-    models: [],
+    /** 同千问：先只给快速模式，思考开关实测后再加。 */
+    models: [{
+      id: "doubao-fast",
+      name: "LDW · 豆包（快速）",
+      description: "真实浏览器驱动豆包网页版",
+      thinking: false
+    }],
     contextWindow: 32768,
     maxOutputTokens: 8192,
   },
@@ -139,7 +273,21 @@ function validateProvider(p) {
 	const input = o.input;
 	if (input === void 0 || !Array.isArray(input.selectors) || input.selectors.length === 0) return "input.selectors 必须是非空数组";
 	const send = o.send;
-	if (send === void 0 || !Array.isArray(send.selectors) || send.selectors.length === 0) return "send.selectors 必须是非空数组";
+	/**
+	* 发送选择器允许为空 —— **仅限未验证的 provider**（2026-10-16）。
+	*
+	* 为什么放行：`buildTriggerScript` 本来就有两层兜底（输入框往上 6 层找
+	* 按钮 + 几何/标签打分 + Enter 兜底），所以「没有语义选择器」≠「发不出去」，
+	* 只是**还没验证过**。旧规则一律拒空数组，导致元宝/豆包这两个刚加进来的
+	* 平台**被校验器直接跳过、根本没注册成 provider** —— 用户在设置页里
+	* 完全看不到它们（真实 bug，加载冒烟测试抓到的）。
+	*
+	* 已验证的 provider 仍然必须给选择器：那是「实测过能用」的标志，
+	* 空着就说明配置没写完，宁可报错也别上线。
+	*/
+	const pendingValidation = o.adapterStatus === "pending-validation";
+	if (send === void 0 || !Array.isArray(send.selectors)) return "send.selectors 必须是数组";
+	if (send.selectors.length === 0 && !pendingValidation) return "send.selectors 必须是非空数组（未验证 provider 可标记 adapterStatus=pending-validation）";
 	if (typeof o.completionPath !== "string" || o.completionPath === "") return "缺少 completionPath";
 	if (!Array.isArray(o.models)) return "models 必须是数组";
 	if (o.models.length === 0 && o.adapterStatus !== "pending-validation") return "models 必须是非空数组（未验证 provider 可标记 adapterStatus=pending-validation）";
@@ -1099,6 +1247,26 @@ function checkConfig(raw) {
 	* 这样驱动器自己也能独立跑（不依赖 host 传全量配置）。
 	*/
 	out.edgeDriver = normalizeEdgeDriverConfig(src.edgeDriver, problems);
+	/**
+	* ## 多账号：`accounts` 嵌套对象（2026-10-16，用户点名要的）
+	*
+	* 形状：
+	*
+	*     accounts: {
+	*       "deepseek": { slots: ["default", "work"], active: "default" },
+	*       "qwen":     { slots: ["default"] }
+	*     }
+	*
+	*   - `slots`：该平台的账号槽位名（安全字符，会成为 profile 子目录名
+	*     与登录快照槽位名的一部分）。`"default"` 永远存在（首次使用前
+	*     的默认身份）。
+	*   - `active`：该平台**当前生效**的槽位 —— 派任务时带它，驱动器据此
+	*     选 profile 目录，登录快照也按槽位隔离。没填就是 "default"。
+	*
+	* 存储策略与 edgeDriver 一致：坏形状**不报错**，回退空表（= 单账号），
+	* 老配置文件没有这个字段 ⇒ 行为与旧版完全一致。
+	*/
+	out.accounts = normalizeAccountsConfig(src.accounts, problems);
 	return {
 		ok: problems.length === 0,
 		config: out,
@@ -1155,6 +1323,77 @@ function normalizeEdgeDriverConfig(raw, problems) {
 	}
 	return out;
 }
+/**
+* 归一化多账号配置块 `accounts`。
+*
+* 规则：
+*   - 不是对象 ⇒ 空表（单账号行为），记一条 problem
+*   - 每个平台条目必须是对象；`slots` 必须是字符串数组，元素过安全字符白名单
+*     （`[A-Za-z0-9_-]`，因为会拼进文件路径）；空数组/非法元素丢弃
+*   - `active` 必须是 slots 里的成员，否则回退 "default"
+*   - "default" 槽位永远存在（隐式补全），active 缺省 "default"
+*/
+function normalizeAccountsConfig(raw, problems) {
+	const out = {};
+	if (raw === void 0 || raw === null) return out;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		problems.push({
+			field: "accounts",
+			reason: `应为对象，收到 ${Array.isArray(raw) ? "array" : typeof raw}`,
+			fellBackTo: "空表（单账号）"
+		});
+		return out;
+	}
+	for (const platformId of Object.keys(raw)) {
+		if (!/^[A-Za-z0-9_-]{1,64}$/.test(platformId)) {
+			problems.push({
+				field: `accounts.${platformId}`,
+				reason: "平台 id 含非法字符，忽略",
+				fellBackTo: "跳过"
+			});
+			continue;
+		}
+		const entry = raw[platformId];
+		if (entry === void 0 || entry === null || typeof entry !== "object") continue;
+		/** 槽位白名单：会拼进 profile 目录与快照文件名，绝不允许路径逃逸。 */
+		const slots = Array.isArray(entry.slots)
+			? [...new Set(entry.slots.filter((s) => typeof s === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(s)))]
+			: [];
+		if (!slots.includes("default")) slots.unshift("default");
+		let active = typeof entry.active === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(entry.active) ? entry.active : "default";
+		if (!slots.includes(active)) {
+			problems.push({
+				field: `accounts.${platformId}.active`,
+				reason: `active「${active}」不在 slots 里`,
+				fellBackTo: "default"
+			});
+			active = "default";
+		}
+		out[platformId] = { slots, active };
+	}
+	return out;
+}
+/** 某平台的账号配置（没配过 = 只有 default 槽位）。 */
+function accountsForPlatform(accountsConfig, platformId) {
+	return accountsConfig?.[platformId] ?? { slots: ["default"], active: "default" };
+}
+/**
+* 某平台当前生效的账号槽位名。
+*
+* ⚠️ 每次现读配置 —— 用户在设置页切账号后要立刻生效，不能缓存。
+* 派任务时用它决定 job.account。
+*/
+function activeAccountFor(platformId) {
+	return accountsForPlatform(readConfig().config.accounts, platformId).active ?? "default";
+}
+/**
+* 登录快照的槽位名：多账号时是 `平台#槽位`，单账号保持旧格式 `平台`
+* （老快照文件不动，行为向后兼容）。
+*/
+function slotNameFor(platformId, account) {
+	const slot = typeof account === "string" && account !== "" && account !== "default" ? account : "";
+	return slot === "" ? platformId : `${platformId}#${slot}`;
+}
 /** 配置的中文摘要（设置页与日志共用，避免两处措辞不一致）。 */
 function describeConfig(config) {
 	return [
@@ -1206,8 +1445,8 @@ var JobQueue = class {
 		}
 		return reaped;
 	}
-	/** 派一个新任务。 */
-	enqueue(prompt, thinking, platform, expectUrl, freshChat, sessionId) {
+	/** 派一个新任务。`account` 是该任务的账号槽位（多账号隔离用，可空 = default）。 */
+	enqueue(prompt, thinking, platform, expectUrl, freshChat, sessionId, account) {
 		const job = {
 			id: `job-${Date.now()}-${++this.seq}`,
 			prompt,
@@ -1216,7 +1455,8 @@ var JobQueue = class {
 			createdAt: Date.now(),
 			...expectUrl === void 0 ? {} : { expectUrl },
 			...freshChat === true ? { freshChat: true } : {},
-			...sessionId === void 0 || sessionId === "" ? {} : { sessionId }
+			...sessionId === void 0 || sessionId === "" ? {} : { sessionId },
+			...typeof account === "string" && account !== "" && account !== "default" ? { account } : {}
 		};
 		this.jobs.set(job.id, job);
 		/**
@@ -1289,10 +1529,15 @@ var JobQueue = class {
 	*   各自只领自己平台的活，避免 DeepSeek 的面板去发 Qwen 的消息。
 	* @param sessionId - 来领活的窗口是哪个 DSH 会话（拿不到时是 undefined）。
 	*/
-	claimNext(platform, sessionId) {
+	claimNext(platform, sessionId, account) {
 		/** 窗口上报了身份吗？没上报就不做会话过滤。 */
 		const hasIdentity = sessionId !== void 0 && sessionId !== "";
-		const pending = [...this.jobs.values()].filter((j) => j.done === void 0 && j.failed === void 0 && j.claimedAt === void 0 && (platform === void 0 || j.platform === platform));
+		/**
+		 * ⭐ 多账号过滤（2026-10-16）：任务带了 account 槽位时，驱动器只领
+		 * 同槽位的活 —— 否则两个账号的任务会被同一个 profile 的浏览器串发。
+		 * 任务没带（旧版/默认槽位）不过滤，保持兼容。
+		 */
+		const pending = [...this.jobs.values()].filter((j) => j.done === void 0 && j.failed === void 0 && j.claimedAt === void 0 && (platform === void 0 || j.platform === platform) && (typeof account !== "string" || account === "" || j.account === void 0 || j.account === account));
 		if (pending.length === 0) return void 0;
 		/**
 		* ## ⭐⭐⭐ 两轮领活：先本会话，再回退到任意 —— 否则新会话的任务全失败
@@ -1995,7 +2240,14 @@ function createAdapter(deps) {
 			* （那个在没 sessionId 时会退化成 `platform#fingerprint`，
 			* 不是真正的会话标识，client 那边对不上）。
 			*/
-			options.sessionId === void 0 || options.sessionId === "" ? void 0 : String(options.sessionId)
+			options.sessionId === void 0 || options.sessionId === "" ? void 0 : String(options.sessionId),
+			/**
+			* ⭐ 多账号（2026-10-16）：带上该平台**当前生效的账号槽位**。
+			* 驱动器据此选 profile 目录（`edge-ldw/<平台>/<槽位>`），
+			* 登录快照也按槽位隔离（`webin/auth/<平台>#<槽位>.json`）。
+			* 没配置多账号时是 "default"，任务里不写这个字段（与旧版兼容）。
+			*/
+			activeAccountFor(provider.id)
 		);
 		deps.logger?.debug?.(`job ${job.id} 已派发（平台=${provider.id}，会话=${job.sessionId ?? "(无)"}，${diff.note}，${prompt.length} 字符，thinking=${String(spec.thinking)}）`);
 		let result;
@@ -2867,26 +3119,79 @@ function snapshotPath(slot) {
 	return join(stateRoot(), "auth", `${safe}.json`);
 }
 /**
-* 某个平台「已登录」吗？
+ * 某平台某槽位的 **Edge profile 目录**（不依赖 EdgeDriver 实例）。
+ *
+ * 为什么要在 host 半复刻一份：登录门禁 `isPlatformLoggedIn` 是纯函数、
+ * 在 `apply()` 之外调用，拿不到 driver 实例。而它需要知道「去哪个目录
+ * 读 cookie」。
+ *
+ * ⚠️ 这里的**布局规则必须与 edge-driver.js 的 `userDataDirFor()` 保持一致**
+ * （default 槽位不拼账号层）。两处不一致 = 判据和浏览器看不同的目录，
+ * 那正是这次要修的 bug 的同类。改一处必须同步改另一处。
+ */
+function edgeProfileDirFor(platformId, accountId = "default") {
+	const home = process.env.DSH_HOME ?? join(homedir(), ".dsh");
+	const base = join(home, "edge-ldw");
+	const safePlatform = String(platformId).replace(/[^A-Za-z0-9_-]/g, "_");
+	const safeAccount = String(accountId || "default").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48);
+	/** default = 旧布局（平台一层），与 edge-driver 的 userDataDirFor 同步。 */
+	if (safeAccount === "" || safeAccount === "default") return join(base, safePlatform);
+	return join(base, safePlatform, safeAccount);
+}
+/**
+* 某个平台「已登录」吗？（多账号版：**任一槽位**登录过就算）
 *
-* ## 判据：快照存在**且**快照里确实有登录凭据
+* ## 判据：槽位快照存在**且**快照里确实有登录凭据
+*
+* 单账号（无 accounts 配置）= 只有 default 槽位 = 旧文件名 `<平台>.json`，
+* 行为与旧版完全一致。多账号时逐槽位查 `<平台>#<槽位>.json`。
 *
 * 为什么不看「浏览器在线」：那样重启 DSH 后、用户还没切到 LDW 标签时，
 * 模型会从选择器里消失 —— 用户会以为插件坏了。
-*
-* 快照是**持久化**的（`~/.dsh/webin/auth/<platform>.json`），
-* 它记录的是「上次确实登录过」。所以用它判断「能否使用 LDW 模型」最稳：
-*   - 登录过 ⇒ 模型可选，即便此刻浏览器没开（发送时会提示打开标签）
-*   - 没登录过 ⇒ 模型不列出，用户先去登录
 *
 * ⚠️ 注意用 `snapshotTextLooksLoggedIn` 而不是「文件存在」——
 * 未登录时页面也会写 `userToken={"value":null}`，那种快照不算登录。
 */
 function isPlatformLoggedIn(platform) {
 	try {
-		const path = snapshotPath(platform);
-		if (!existsSync(path)) return false;
-		return snapshotTextLooksLoggedIn(readFileSync(path, "utf8"));
+		/** 旧格式单文件（default 槽位 + 老版本写入的）。 */
+		const legacyPath = snapshotPath(platform);
+		if (existsSync(legacyPath) && snapshotTextLooksLoggedIn(readFileSync(legacyPath, "utf8"))) return true;
+		/** 多账号槽位文件：`平台#槽位.json`。 */
+		const slots = accountsForPlatform(readConfig().config.accounts, platform).slots ?? [];
+		for (const slot of slots) {
+			if (slot === "default") continue;
+			const path = snapshotPath(`${platform}#${slot}`);
+			if (existsSync(path) && snapshotTextLooksLoggedIn(readFileSync(path, "utf8"))) return true;
+		}
+		/**
+		 * ## 第二条判据：直接读 Edge profile 的 Cookie（2026-10-16 加，破死锁）
+		 *
+		 * 为什么必须有这条：快照**只在任务跑通之后**才写，于是
+		 *
+		 * ```
+		 *   没有快照 ⇒ 门禁判 false ⇒ 任务不入队 ⇒ runJob 不跑 ⇒ 快照写不出来
+		 * ```
+		 *
+		 * 死锁。用户实测报的就是「我明明登录了，它一直说我没登录」——
+		 * 登录态（`hy_token` 等）好好躺在 `<profile>/Default/Network/Cookies` 里，
+		 * 只是判据没去那儿看。
+		 *
+		 * 这条判据的性质（都是用户明确关心的点）：
+		 *   - **零成本**：只读 SQLite 文件，不起 Edge、不联网、不占内存
+		 *   - **跨重启**：cookie 持久化，重启 DSH 后依然成立
+		 *   - **不解密**：只看 cookie 名与密文长度，不碰值
+		 *
+		 * 失败一律**静默回退到 false**（等于维持旧行为），绝不因为读 cookie
+		 * 出错就把插件搞挂 —— 那会让「配置坏了」升级成「插件坏了」。
+		 */
+		try {
+			const accountId = accountsForPlatform(readConfig().config.accounts, platform).active ?? "default";
+			const dir = edgeProfileDirFor(platform, accountId);
+			const probe = isLoggedInByCookies(platform, dir);
+			if (probe.loggedIn === true) return true;
+		} catch { /* cookie 判据只是加分项，失败不影响旧判据 */ }
+		return false;
 	} catch {
 		return false;
 	}
@@ -3400,29 +3705,43 @@ async function apply(ctx) {
 				* （`sendDelay*` 的随机间隔、全局单例），并行会同时暴露多个
 				* 浏览器指纹并发的特征，反而危险。
 				*/
-				const pendingPlatforms = [...new Set(
-					queue.inspect().filter((j) => j.state === "pending").map((j) => j.platform).filter(Boolean)
-				)];
-				if (pendingPlatforms.length === 0) return;
+				/**
+				 * ⭐ 多账号（2026-10-16）：每个平台的任务再按**账号槽位**分组。
+				 * 同平台不同槽位的任务要用不同的 Edge profile（不同登录身份），
+				 * 驱动器是串行的，所以逐「平台×槽位」处理，切槽位时会自动重启
+				 * Edge（ensureEdge 里 shutdownEdge）。
+				 */
+				const pendingTargets = [];
+				{
+					const seen = /* @__PURE__ */ new Set();
+					for (const j of queue.inspect()) {
+						if (j.state !== "pending" || !j.platform) continue;
+						const key = `${j.platform}#${j.account ?? "default"}`;
+						if (seen.has(key)) continue;
+						seen.add(key);
+						pendingTargets.push({ platformId: j.platform, account: j.account ?? "default" });
+					}
+				}
+				if (pendingTargets.length === 0) return;
 
-				for (const platformId of pendingPlatforms) {
+				for (const { platformId, account } of pendingTargets) {
 					if (edgeDriver.busy === true || edgeDriver.stopping === true) break;
-					/** 这个平台的活还在不在？（前面的平台可能已经把它领走了） */
-					if (!queue.inspect().some((j) => j.state === "pending" && j.platform === platformId)) continue;
+					/** 这个「平台×槽位」的活还在不在？（前面的目标可能已经把它领走了） */
+					if (!queue.inspect().some((j) => j.state === "pending" && j.platform === platformId && (j.account ?? "default") === account)) continue;
 
 					try {
-						await edgeDriver.ensureEdge(platformId);
+						await edgeDriver.ensureEdge(platformId, account);
 					} catch (e) {
 						/**
 						 * 这个平台起不来（没登录 / 没有浏览器 / 配置错）⇒ 跳过它，
 						 * 别让它拖垮别的平台。任务会在 `claimGraceMs` 后由 host
 						 * 判失败并给出可读的原因。
 						 */
-						log.warn?.(`edge-driver 平台 ${platformId} 起不来: ${String(e?.message ?? e)}`);
+						log.warn?.(`edge-driver 平台 ${platformId}#${account} 起不来: ${String(e?.message ?? e)}`);
 						continue;
 					}
 
-					const job = queue.claimNext(platformId, void 0);
+					const job = queue.claimNext(platformId, void 0, account);
 					if (job === void 0) continue;
 					edgeDriver.busy = true;
 					edgeDriver.pending = { jobId: job.id, startedAt: Date.now() };
@@ -3451,7 +3770,8 @@ async function apply(ctx) {
 						try {
 							const snap = await edgeDriver.snapshot();
 							if (typeof snap === "string" && snap.trim() !== "" && snap.trim() !== "{}") {
-								await writeAtomic(snapshotPath(job.platform ?? platformId), snap);
+								/** ⭐ 按任务携带的账号槽位写快照（多账号隔离）。 */
+								await writeAtomic(snapshotPath(slotNameFor(job.platform ?? platformId, job.account)), snap);
 							}
 						} catch (e) {
 							log.debug?.(`edge-driver 写快照失败（不影响本轮）: ${String(e?.message ?? e)}`);
@@ -3984,6 +4304,126 @@ async function apply(ctx) {
 				});
 				return;
 			}
+			/**
+			* ## GET /accounts —— 多账号管理（2026-10-16，用户点名要的）
+			*
+			* 返回每个平台的账号槽位、当前生效槽位、以及「该槽位登录过没有」。
+			* 设置页据此渲染「账号槽位列表 + 切换 + 新增」。
+			*/
+			if (method === "GET" && pathname === `${API_PREFIX}/accounts`) {
+				const { config: cfg, problems } = readConfig();
+				const accounts = cfg.accounts ?? {};
+				const platforms = registry.all().map((p) => {
+					const entry = accountsForPlatform(accounts, p.id);
+					/** 逐槽位查登录快照（default 走旧文件名，其余 `平台#槽位`）。 */
+					const slotStatus = entry.slots.map((slot) => {
+						let loggedIn = false;
+						try {
+							const path = snapshotPath(slotNameFor(p.id, slot));
+							loggedIn = existsSync(path) && snapshotTextLooksLoggedIn(readFileSync(path, "utf8"));
+						} catch {}
+						return { slot, loggedIn };
+					});
+					return {
+						platform: p.id,
+						name: p.name,
+						slots: entry.slots,
+						active: entry.active,
+						slotStatus
+					};
+				});
+				sendJson(res, 200, {
+					ok: true,
+					platforms,
+					/** 配置归一化时丢弃/回退的字段（设置页提示用户）。 */
+					problems: problems.filter((pr) => pr.field.startsWith("accounts"))
+				});
+				return;
+			}
+			/**
+			* ## PUT /accounts —— 更新一个平台的账号槽位表 / 切换当前账号
+			*
+			* body：`{"platform":"deepseek","slots":["default","work"],"active":"work"}`
+			*
+			* 只改这一个平台，其他平台的配置原样保留（read-modify-write）。
+			* 原子写，坏配置会被归一化层拦住。
+			*/
+			if (method === "PUT" && pathname === `${API_PREFIX}/accounts`) {
+				const body = await readBody(req);
+				let payload;
+				try {
+					payload = JSON.parse(body);
+				} catch {
+					sendJson(res, 400, { ok: false, reason: "invalid-json" });
+					return;
+				}
+				const platformId = payload?.platform;
+				if (typeof platformId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(platformId)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-platform" });
+					return;
+				}
+				const { config: cfg } = readConfig();
+				const accounts = { ...(cfg.accounts ?? {}) };
+				/**
+				 * 归一化写回：把单平台条目过一遍白名单再落盘。
+				 * "default" 永远在 slots 里（隐式补全）。
+				 */
+				const slots = Array.isArray(payload.slots)
+					? [...new Set(payload.slots.filter((s) => typeof s === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(s)))]
+					: ["default"];
+				if (!slots.includes("default")) slots.unshift("default");
+				const active = typeof payload.active === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(payload.active) && slots.includes(payload.active) ? payload.active : "default";
+				accounts[platformId] = { slots, active };
+				await writeConfigFile({ ...cfg, accounts });
+				log.info?.(`账号配置已更新：${platformId} slots=[${slots.join(",")}] active=${active}`);
+				sendJson(res, 200, { ok: true, platform: platformId, slots, active });
+				return;
+			}
+			/**
+			* ## DELETE /accounts/<platform>/<slot> —— 删一个账号槽位
+			*
+			* 删槽位 = 从配置移除 + 删该槽位的登录快照 + 提示用户 profile 目录
+			* 留着（里面是完整的浏览器登录态，删快照不影响再次登录；真要清
+			* 浏览器数据由用户手动删 `~/.dsh/edge-ldw/<平台>/<槽位>`）。
+			* "default" 槽位不允许删（它是兜底身份）。
+			*/
+			if (method === "DELETE" && pathname.startsWith(`${API_PREFIX}/accounts/`)) {
+				const rest = pathname.slice(`${API_PREFIX}/accounts/`.length);
+				const slash = rest.indexOf("/");
+				const platformId = slash === -1 ? rest : rest.slice(0, slash);
+				const slot = slash === -1 ? "" : rest.slice(slash + 1);
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(platformId) || !/^[A-Za-z0-9_-]{1,48}$/.test(slot)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-path" });
+					return;
+				}
+				if (slot === "default") {
+					sendJson(res, 400, { ok: false, reason: "default 槽位不可删除（它是兜底身份）" });
+					return;
+				}
+				const { config: cfg } = readConfig();
+				const accounts = { ...(cfg.accounts ?? {}) };
+				const entry = accountsForPlatform(accounts, platformId);
+				const slots = entry.slots.filter((s) => s !== slot);
+				if (slots.length === entry.slots.length && entry.slots.every((s) => s !== slot)) {
+					sendJson(res, 404, { ok: false, reason: "槽位不存在" });
+					return;
+				}
+				const active = entry.active === slot ? "default" : entry.active;
+				accounts[platformId] = { slots, active };
+				await writeConfigFile({ ...cfg, accounts });
+				/** 删该槽位的登录快照（有的话）。 */
+				let snapshotRemoved = false;
+				try {
+					const path = snapshotPath(slotNameFor(platformId, slot));
+					if (existsSync(path)) {
+						await unlink(path);
+						snapshotRemoved = true;
+					}
+				} catch {}
+				log.info?.(`账号槽位已删除：${platformId}#${slot}（快照${snapshotRemoved ? "已删" : "本就没有"}，profile 目录保留）`);
+				sendJson(res, 200, { ok: true, platform: platformId, slot, slots, active, snapshotRemoved });
+				return;
+			}
 			if (method === "POST" && pathname === `${API_PREFIX}/client/heartbeat`) {
 				const body = await readBody(req);
 				let payload;
@@ -4243,6 +4683,15 @@ async function apply(ctx) {
 					* 也读这个字段决定显示「去登录」还是「已登录」。
 					*/
 					loggedInPlatforms: loggedInPlatforms(registry.all()),
+					/** 多账号：每平台的账号槽位与当前生效槽位（2026-10-16）。 */
+					accounts: registry.all().map((p) => {
+						const entry = accountsForPlatform(readConfig().config.accounts, p.id);
+						return {
+							platform: p.id,
+							slots: entry.slots,
+							active: entry.active
+						};
+					}),
 					/**
 					* ## ⭐ 任务队列快照 —— 「所有窗口都生效」时看这里，不用猜
 					*
@@ -4358,6 +4807,79 @@ async function apply(ctx) {
 					ok: true,
 					id,
 					removed
+				});
+				return;
+			}
+			/**
+			* ## PUT /providers/<id> —— 模型切换 / 平台参数覆盖（2026-10-16，用户点名要的）
+			*
+			* **只允许覆盖展示层字段**，绝不接受平台地址 / 选择器 / 抓取配置 ——
+			* 那些改错一条就是「发不出去/抓不到回复」的隐形炸弹：
+			*   - `models`        ：模型清单（想加 `qwen:max` / 删掉某个 LDW 模型都在这改）
+			*   - `name`          ：平台显示名
+			*   - `contextWindow` / `maxOutputTokens`：容量参数
+			*
+			* 实现方式：读当前生效的 provider 定义（内置或自定义），覆盖上面四个
+			* 字段后写成**自定义覆盖文件**（注册表语义本来就是「自定义覆盖内置」）。
+			* 删除覆盖文件（DELETE /providers/<id>）即恢复内置。
+			*
+			* ⚠️ 模型条目只收 `id/name/description/thinking` 四个字段——多余字段
+			* 丢弃，防脏数据进配置。
+			*/
+			if (method === "PUT" && pathname.startsWith(`${API_PREFIX}/providers/`)) {
+				const id = decodeURIComponent(pathname.slice(`${API_PREFIX}/providers/`.length));
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-id" });
+					return;
+				}
+				const body = await readBody(req);
+				let payload;
+				try {
+					payload = JSON.parse(body);
+				} catch {
+					sendJson(res, 400, { ok: false, reason: "invalid-json" });
+					return;
+				}
+				/** 当前生效定义（含内置），找不到就 404。 */
+				const existing = registry.all().find((p) => p.id === id);
+				if (existing === void 0) {
+					sendJson(res, 404, { ok: false, reason: `平台 ${id} 不存在` });
+					return;
+				}
+				/** 覆盖平台显示名（可选）。 */
+				const name = typeof payload.name === "string" && payload.name.trim() !== "" ? payload.name.trim() : existing.name;
+				/** 覆盖模型清单（可选）：逐条白名单提取。 */
+				const models = Array.isArray(payload.models)
+					? payload.models.map((m) => ({
+						...(typeof m?.id === "string" && m.id !== "" ? { id: m.id } : {}),
+						...(typeof m?.name === "string" && m.name !== "" ? { name: m.name } : {}),
+						...(typeof m?.description === "string" && m.description !== "" ? { description: m.description } : {}),
+						...(m?.thinking === true || m?.thinking === false ? { thinking: m.thinking === true } : {})
+					})).filter((m) => typeof m.id === "string" && m.id !== "" && typeof m.name === "string" && m.name !== "")
+					: existing.models;
+				/** 容量参数（可选），非法回退现值。 */
+				const contextWindow = Number.isFinite(Number(payload.contextWindow)) && Number(payload.contextWindow) > 0 ? Math.round(Number(payload.contextWindow)) : existing.contextWindow;
+				const maxOutputTokens = Number.isFinite(Number(payload.maxOutputTokens)) && Number(payload.maxOutputTokens) > 0 ? Math.round(Number(payload.maxOutputTokens)) : existing.maxOutputTokens;
+				/** 以当前生效定义打底（保留选择器等全部既有配置），覆盖展示层字段。 */
+				const merged = { ...existing, name, models, contextWindow, maxOutputTokens };
+				const loaded = new ProviderRegistry().loadCustom([merged]);
+				if (loaded.accepted.length === 0) {
+					sendJson(res, 400, { ok: false, reason: loaded.rejected[0]?.reason ?? "覆盖后校验失败（models 不能为空，除非 pending-validation）" });
+					return;
+				}
+				await writeCustomProvider(merged);
+				registry.loadCustom([merged]);
+				syncProviders();
+				log.info?.(`平台 ${id} 已更新：models=[${models.map((m) => m.id).join(",")}] contextWindow=${contextWindow}`);
+				sendJson(res, 200, {
+					ok: true,
+					id,
+					route: routeFor(id),
+					models: models.map((m) => m.id),
+					contextWindow,
+					maxOutputTokens,
+					/** 提示用户：删除覆盖文件可恢复内置定义。 */
+					revertHint: `DELETE ${API_PREFIX}/providers/${id} 恢复内置`
 				});
 				return;
 			}

@@ -64,7 +64,10 @@ Ok "备份完成（$n 个文件）"
 
 # ── 2. 放文件（整文件覆盖 —— 补丁版 lib 已含全部改动，天然幂等） ──
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-foreach ($f in @('edge-driver.js','edge-driver-scripts.js','index.js','client.js')) {
+# ⚠️ login-cookie-probe.js 是 2026-10-16 新增的模块（读 Edge profile cookie
+#    判登录态，破「未登录快照 ⇒ 任务不入队 ⇒ 快照写不出」死锁）。
+#    index.js 会 import 它 —— 漏装会让插件**加载即崩**，所以必须在清单里。
+foreach ($f in @('edge-driver.js','edge-driver-scripts.js','index.js','client.js','login-cookie-probe.js')) {
     $src = Join-Path $here "patch\$f"
     if (-not (Test-Path $src)) { Die "缺少 patch\$f" }
     Copy-Item $src (Join-Path $libDir $f) -Force

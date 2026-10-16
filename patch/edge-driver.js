@@ -498,12 +498,50 @@ export class EdgeDriver {
     return this.config.port;
   }
 
-  /** 登录资料目录按「网站/账号槽位」隔离。槽位只允许安全字符，不包含手机号或凭证。 */
+  /**
+   * 登录资料目录按「网站/账号槽位」隔离。槽位只允许安全字符，不包含手机号或凭证。
+   *
+   * ## ⚠️⚠️ default 槽位**必须**沿用旧路径（2026-10-16 真机实测修）
+   *
+   * 曾经的写法是**无条件**拼一层账号：
+   *
+   * ```
+   * return join(base, safePlatform, safeAccount);   // ❌ 会毁掉所有既有登录态
+   * ```
+   *
+   * 为什么这是致命的（用户报「元宝明明登录了却发不出去」的**真正根因**）：
+   *
+   *   - Edge 的 profile 布局是 `<user-data-dir>/Default/`（大小写不敏感）
+   *   - 旧版 user-data-dir = `<base>/yuanbao`
+   *     ⇒ 真 profile 落在 `<base>/yuanbao/Default/` ← **登录态在这里**
+   *   - 加了多账号后 user-data-dir = `<base>/yuanbao/default`
+   *     ⇒ 在 Windows 上 `yuanbao/default` 与 `yuanbao/Default` **是同一个目录**！
+   *     ⇒ 于是 Edge 把**它自己那个 profile 目录**当成了 user-data-dir，
+   *       再往里建一层 `Default/`，得到 `<base>/yuanbao/Default/Default/`
+   *     ⇒ 那是一个**全新空白身份**：0 条 cookie、未登录
+   *
+   * 实测证据（A/B，同一台机同一个元宝账号）：
+   *
+   *   | user-data-dir | 探测结果 |
+   *   |---|---|
+   *   | `<base>/yuanbao`          | `loggedIn: true` ✅（hy_token 663B 密文在位）|
+   *   | `<base>/yuanbao/default`  | `loggedIn: false` ❌（新目录 0 条 tencent cookie）|
+   *
+   * 后果是一条**死锁**：页面未登录 ⇒ host 门禁 `isPlatformLoggedIn` 判 false
+   * ⇒ 任务根本不入队 ⇒ 快照永远写不出来（快照只在任务跑通后写）⇒ 门禁继续 false。
+   * 用户看到的就是「登录态明明在，却一直说我没登录」。
+   *
+   * 所以：**default 槽位 = 平台一层（旧布局，兼容所有既有登录态）**；
+   * 只有**真正的多账号**（`work` 之类）才多拼一层。
+   * 这样旧登录态原地复活，且新槽位仍然互相隔离。
+   */
   userDataDirFor(platformId, accountId = "default") {
     const base = resolveUserDataDir(this.config.userDataDir);
     const safePlatform = String(platformId).replace(/[^A-Za-z0-9_-]/g, "_");
     const safeAccount = String(accountId || "default").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48);
-    return join(base, safePlatform, safeAccount || "default");
+    /** default（含空值）= 旧布局，**不**拼账号层 —— 见上方长注释。 */
+    if (safeAccount === "" || safeAccount === "default") return join(base, safePlatform);
+    return join(base, safePlatform, safeAccount);
   }
 
   /** 等 CDP 端口可用。 */
@@ -724,8 +762,20 @@ export class EdgeDriver {
     }
 
     // 3) 未适配回复捕获策略时禁止发送，避免消息发出后只能超时或误读页面文本。
-    if (provider?.id !== "deepseek" && provider?.replyCapture?.type !== "dom") {
-      throw new Error(`平台 ${provider?.name ?? provider?.id ?? "未知"} 尚未配置经过验证的回复捕获策略，暂不发送测试消息。`);
+    /**
+     * ⚠️ 判据升级（2026-10-16）：光有 `replyCapture.type === "dom"` **不够** ——
+     * 元宝/豆包声明了 dom 策略但 `replySelectors` 是空数组，那样发出去也抓不到
+     * 回复，只能干等到超时（用户会看到「发成功了但没反应」）。
+     *
+     * 所以这里要求**真的有回复选择器**；没有就明确拒绝发送，并说清缺什么。
+     * 这是「宁可不让发，也不留下抓不到回复的僵尸任务」。
+     */
+    if (provider?.id !== "deepseek") {
+      const rc = provider?.replyCapture;
+      const hasReplySelectors = rc?.type === "dom" && Array.isArray(rc.replySelectors) && rc.replySelectors.length > 0;
+      if (!hasReplySelectors) {
+        throw new Error(`平台「${provider?.name ?? provider?.id ?? "未知"}」还没配好回复抓取选择器（replyCapture.replySelectors 为空），发出去也读不到回复，因此暂不发送。请先在该平台的 provider 配置里补上助手消息的选择器。`);
+      }
     }
     // 4) Hook 仅 DeepSeek 可用；其它站点按 provider 声明的 DOM 策略读取。
     await this.ensureHook(provider);
@@ -777,6 +827,35 @@ export class EdgeDriver {
 
     // 5) 填字：使用 provider 自己声明的输入选择器。
     const fillHints = { inputSelectors: provider?.input?.selectors ?? [] };
+
+    /**
+     * ## 思考开关（2026-10-16 接通）
+     *
+     * `buildThinkingScript` 一直躺在 scripts 里、也被 import 了，但 **runJob
+     * 从来没调用它** —— 于是 `ldw-think`（深度思考）在 Edge 驱动器这条路上
+     * 静默失效：模型清单里写着「开启思考」，实际页面上的开关根本没动。
+     *
+     * 现在按 job.thinking 拨一次：
+     *   - **只在页面确实有这个开关时才动**（找不到就跳过，不报错）
+     *   - **失败不阻断发送** —— 思考是加分项，不是发消息的前提
+     *   - 有歧义（多个候选、状态不一致）时脚本自己会拒绝点，这里只记日志
+     *
+     * ⚠️ 必须在**填字之前**拨：DeepSeek 页面切换思考模式会重渲染输入区，
+     * 先填字会被那次重渲染吞掉（触发阶段的 EXPECT 校验会因此报 input-lost）。
+     */
+    if (job.thinking === true || job.thinking === false) {
+      try {
+        const th = JSON.parse(String(await this.evalInPage(buildThinkingScript(job.thinking === true), 15000)));
+        if (th.ok === true) {
+          if (this.config.verboseLog) this.log.debug?.(`[edge-driver] 思考开关已${job.thinking ? "打开" : "关闭"}（${th.text ?? th.aria ?? "?"}）`);
+        } else if (this.config.verboseLog) {
+          this.log.debug?.(`[edge-driver] 思考开关未拨动（${th.reason ?? "unknown"}）—— 不影响本轮发送`);
+        }
+      } catch (e) {
+        this.log.debug?.(`[edge-driver] 思考开关异常（不影响本轮）: ${String(e?.message ?? e)}`);
+      }
+    }
+
     const fill = JSON.parse(String(await this.evalInPage(buildFillScript(prompt, fillHints), 20000)));
     if (fill.ok !== true) {
       throw new Error(`填入输入框失败：${fill.message ?? fill.stage ?? "未知"}`);
@@ -795,6 +874,14 @@ export class EdgeDriver {
       sendSelectors: provider?.send?.selectors ?? [],
       signatures: provider?.send?.signatures ?? [],
       vetoes: provider?.send?.vetoes ?? [],
+      /**
+       * ⭐ 强制 Enter 发送（2026-10-16）。
+       *
+       * 元宝/豆包的发送键不在输入框附近的 DOM 里，附近全是陷阱按钮
+       * （添加、切换模型、AI 生图、PPT 生成、录音转写…），几何打分必然误点。
+       * 这两站声明 `send.enterOnly = true` ⇒ 直接按 Enter，不碰任何按钮。
+       */
+      enterOnly: provider?.send?.enterOnly === true,
     };
     const trig = JSON.parse(String(await this.evalInPage(buildTriggerScript(triggerHints, prompt), 20000)));
     if (trig.ok !== true) {
