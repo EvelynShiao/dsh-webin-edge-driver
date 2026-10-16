@@ -23,7 +23,8 @@
   ],
   "scripts": {
     "verify": "node scripts/verify-package.mjs",
-    "test": "node scripts/test-slot-names.mjs"
+    "test": "node scripts/test-slot-names.mjs",
+    "test:render": "node scripts/render-smoke.mjs"
   },
   "license": "Apache-2.0",
   "repository": {
