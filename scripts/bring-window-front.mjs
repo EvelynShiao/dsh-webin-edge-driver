@@ -53,12 +53,22 @@ async function main() {
 
   if (winId === undefined) { console.log("❌ 拿不到 windowId"); ws.close(); process.exit(1); }
 
-  /** 拉到屏幕内（与 driver 的 setWindowVisible(false) 同一组坐标）。 */
+  /**
+   * ⚠️ 必须**两步**（实测踩到）：
+   * 窗口如果是 minimized，一次性把 windowState+bounds 传进去，
+   * Chromium 会「恢复」到**它记住的旧位置**（也就是屏幕外），
+   * 我传的 left/top 被忽略 —— 读回来还是 -21845。
+   * 所以：先恢复成 normal，**再**单独设位置。
+   */
+  if (before && before.windowState && before.windowState !== "normal") {
+    await send("Browser.setWindowBounds", { windowId: winId, bounds: { windowState: "normal" } });
+    await sleep(500);
+  }
   await send("Browser.setWindowBounds", {
     windowId: winId,
-    bounds: { left: 80, top: 60, width: 1100, height: 820, windowState: "normal" },
+    bounds: { left: 80, top: 60, width: 1100, height: 820 },
   });
-  await sleep(400);
+  await sleep(500);
   /** 再置顶：光挪位置不够，它在别的窗口后面你也看不见。 */
   await send("Page.bringToFront", {});
   await sleep(400);
