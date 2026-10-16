@@ -12,6 +12,7 @@ import {
   isSafeSnapshotName,
   safePathSegment,
 } from "../lib/slot-names.js";
+import { join } from "node:path";
 
 let pass = 0;
 const fails = [];
@@ -83,19 +84,27 @@ eq("四个槽位四个文件", uniq.size, 4);
  * `safePathSegment` 之后，这里至少把 driver 那侧真跑一遍。
  */
 const { EdgeDriver, EDGE_DRIVER_DEFAULTS } = await import("../lib/edge-driver.js");
+/**
+ * 测试用的基准目录。
+ *
+ * ⚠️ 期望值必须用 `join()` 拼，**不能写死 `X:\\fake-ldw\\deepseek` 这种字面量** ——
+ * 那样在 Linux / 手机上跑会 5 项全红（分隔符是 `/`），而它其实**不是**规则错了。
+ * 2026-10-17 在手机上就是这个假警报。
+ */
+const BASE = "X:\\fake-ldw";
 const drv = new EdgeDriver({
-  config: { ...EDGE_DRIVER_DEFAULTS, enabled: false, userDataDir: "X:\\fake-ldw" },
+  config: { ...EDGE_DRIVER_DEFAULTS, enabled: false, userDataDir: BASE },
   log: { info() {}, warn() {}, debug() {} },
   getProvider: () => undefined,
 });
 const dir = (slot) => drv.userDataDirFor("deepseek", slot);
-eq("default 槽位不拼账号层", dir("default"), "X:\\fake-ldw\\deepseek");
-eq("中文槽位被保留", dir("奶奶"), "X:\\fake-ldw\\deepseek\\奶奶");
+eq("default 槽位不拼账号层", dir("default"), join(BASE, "deepseek"));
+eq("中文槽位被保留", dir("奶奶"), join(BASE, "deepseek", "奶奶"));
 eq("两个中文槽位不撞车", dir("奶奶") === dir("爷爷"), false);
-eq("英文槽位照常", dir("work"), "X:\\fake-ldw\\deepseek\\work");
+eq("英文槽位照常", dir("work"), join(BASE, "deepseek", "work"));
 /** 危险字符即使绕过入口校验，也不会造出目录层级。 */
-eq("斜杠不会造层级", dir("a/b"), "X:\\fake-ldw\\deepseek\\a_b");
-eq("穿越不会逃逸", dir(".."), "X:\\fake-ldw\\deepseek");
+eq("斜杠不会造层级", dir("a/b"), join(BASE, "deepseek", "a_b"));
+eq("穿越不会逃逸", dir(".."), join(BASE, "deepseek"));
 
 // ── 输出 ────────────────────────────────────────────────────
 console.log("\n槽位名规则测试\n" + "─".repeat(56));
