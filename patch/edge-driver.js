@@ -661,7 +661,35 @@ export class EdgeDriver {
     }
     const auth = provider?.authProbe;
     if (auth?.type !== "dom" || !Array.isArray(auth.loggedOutSelectors) || !Array.isArray(auth.loggedInSelectors)) {
-      return { loggedIn: false, unsupported: true, reason: "该站点尚无经过验证的登录探针" };
+      /**
+       * ## 没有 authProbe 的 provider：退化为「输入框在不在」（2026-10-16 修）
+       *
+       * 原来这里一律返回 `{loggedIn:false, unsupported:true}`，而 `runJob`
+       * 看到 `loggedIn !== true` 就抛 `WEBIN_NOT_LOGGED_IN` 并把窗口叫到前台 ——
+       * 后果是**用户自己写的自定义 provider 永远发不出消息**（它有输入框、
+       * 也确实登录着，只是没声明 authProbe 而已）。真实 bug。
+       *
+       * 退化判据（`provider.input.selectors` 里**任一可见**即算登录）：
+       *   - 输入框存在 = 页面已经进到聊天界面 = 基本可以认为登录着
+       *   - 未登录时页面通常只剩登录页，输入框压根不存在 ⇒ 判 false
+       *
+       * 这不如专用探针精确，但对「我们不了解的站点」是唯一合理的推断，
+       * 而且**失败方向安全**：真没登录的话，后面发送/抓回复那几步会报出
+       * 更具体的原因，不会静默出错。
+       */
+      const fallbackSel = Array.isArray(provider?.input?.selectors) ? provider.input.selectors : [];
+      if (fallbackSel.length === 0) {
+        return { loggedIn: false, unsupported: true, reason: "该站点尚无经过验证的登录探针" };
+      }
+      try {
+        const spec = JSON.stringify(fallbackSel);
+        const expr = `(() => { const sels=${spec}; const visible=(e)=>!!(e&&(e.offsetWidth||e.offsetHeight||e.getClientRects().length)); const hit=sels.find(q=>{try{return [...document.querySelectorAll(q)].some(visible)}catch{return false}}); return JSON.stringify({loggedIn:hit!==undefined,inputVisible:hit??null,url:location.href,fallback:true}) })()`;
+        const r = JSON.parse(String(await this.evalInPage(expr, 15000)));
+        if (this.config.verboseLog) {
+          this.log.debug?.(`[edge-driver] ${provider?.id} 无 authProbe，用输入框退化判据：loggedIn=${r.loggedIn}${r.inputVisible ? ` (${r.inputVisible})` : ""}`);
+        }
+        return r;
+      } catch { return { loggedIn: false }; }
     }
     try {
       const spec = JSON.stringify({ loggedOutSelectors: auth.loggedOutSelectors, loggedInSelectors: auth.loggedInSelectors });

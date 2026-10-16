@@ -3190,6 +3190,25 @@ function isPlatformLoggedIn(platform) {
 			const dir = edgeProfileDirFor(platform, accountId);
 			const probe = isLoggedInByCookies(platform, dir);
 			if (probe.loggedIn === true) return true;
+			/**
+			 * ## 自定义平台：判不了就**放行**（fail-open）
+			 *
+			 * `reason === "no-rule"` 意思是「这个平台没有 cookie 规则」——
+			 * 也就是**内置四站之外的自定义 provider**（用户自己写的 JSON）。
+			 *
+			 * 为什么必须放行：自定义平台的登录方式千奇百怪（可能只要一个
+			 * 匿名 session、可能是内网免登录），我们**没有判据也不该瞎判**。
+			 * 之前一律 return false ⇒ 门禁永远拦着 ⇒ 自定义平台**根本用不了**
+			 * （`listModels` 不列模型、`streamOnce` 直接报未登录）。这是真实 bug。
+			 *
+			 * 放行的代价可控：真正有没有登录，`runJob` 里还有一道
+			 * `probe()` 守卫（找不到输入框就会抛错并说明原因），不会静默出错。
+			 *
+			 * ⚠️ 只在 `no-rule` 时放行：`no-login-cookie`（有规则但没凭据）
+			 * 和 `profile-unreadable`（读不了）都必须保持 false，
+			 * 否则内置四站会全部误判成已登录。
+			 */
+			if (probe.reason === "no-rule") return true;
 		} catch { /* cookie 判据只是加分项，失败不影响旧判据 */ }
 		return false;
 	} catch {
