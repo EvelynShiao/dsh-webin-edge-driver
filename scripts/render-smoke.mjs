@@ -161,7 +161,20 @@ function makeFakeReact(runtime) {
 		if (runtime.mode === "fill" && value === null) return makeFillProxy("(fill)");
 		return value;
 	};
+	/**
+	 * 类组件（错误边界）要 `extends react.Component` —— 给个最小实现。
+	 *
+	 * ⚠️ 注意：本测试的 `createElement` 是**立刻**调用子组件的，所以错误边界
+	 * **拦不住**这里的错误（子组件在父组件的参数位置就已经抛了）—— 这是故意的：
+	 * 边界是给用户的护栏，不是给测试的遮羞布。真崩了，测试照样 FAIL。
+	 */
+	class SmokeComponent {
+		constructor(props) { this.props = props ?? {}; this.state = {}; }
+		setState(next) { Object.assign(this.state, typeof next === "function" ? next(this.state) : next); }
+	}
 	return {
+		Component: SmokeComponent,
+		PureComponent: SmokeComponent,
 		createElement,
 		Fragment: Symbol("Fragment"),
 		StrictMode: ({ children }) => children ?? null,
