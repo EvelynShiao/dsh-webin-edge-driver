@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-10-16 · 🎉 手机上真的能跑了 —— 之前「手机不可能工作」的结论是**错的**
+
+上一版我写过「不打算让它在手机上『能跑』—— 那是设计边界，不是 bug。手机端应停用本插件」。
+**那个结论错了。** 手机上 Chrome 起不来不是设计边界，是一个**能修的环境坑**。
+修完之后手机实测：CDP 稳定、元宝页面能加载、能往输入框填字、能读回、能截图。
+
+### 症状（极难猜，所以记下来）
+
+`--headless=new --remote-debugging-port=…` 起 Chrome：**CDP 端口起来了**
+（打印 `DevTools listening on ws://…`）**随即 SIGTRAP 死亡**，一句日志都不打。
+
+### 根因：proot 把「重开 /proc/self/fd/N」变成了 dup
+
+DSH 的 Android 版把 Linux 环境跑在自带的 proot 里（`PROOT_LOADER` 指向
+`libprootloader.so`）。它把 `open("/proc/self/fd/N", O_RDONLY)` **变成 `dup()`** ——
+返回的 fd 与原 fd 共享同一个文件描述符，权限和偏移都跟着原 fd 走。
+用纯 python 就能复现（与 Chrome 无关）：
+
+| 怎么重开 | 期望 | 实际 |
+|---|---|---|
+| memfd，`/proc/self/fd/N`，O_RDONLY | O_RDONLY | **O_RDWR** ❌ |
+| 普通文件，`/proc/self/fd/N`，O_RDONLY | O_RDONLY | **O_RDWR** ❌ |
+| 普通文件，`/dev/fd/N`，O_RDONLY | O_RDONLY | O_RDONLY ✅ |
+
+而 Chromium 建共享内存**正是靠这一手拿「只读句柄」**：
+
+```
+memfd_create("shared-memory-region")  = 75
+fcntl(75, F_ADD_SEALS, …)             = 0
+open("/proc/self/fd/75", O_RDONLY)    = 76   ← proot 偷偷 dup
+close(75); dup(76) = 75
+fcntl(75, F_GETFL) = O_RDWR           ← 本该 O_RDONLY！
+--- SIGTRAP ---                       ← FD ownership 校验判违规 → 主动 brk 自杀
+```
+
+那句 `Crashing due to FD ownership violation:` 它**其实打印了**，但紧接着就 brk、
+stderr 缓冲没刷出去，所以默认一个字都看不到（把那条 `brk` 改成 `nop` 才能看到）。
+
+### 修法：让 memfd_create 失败，逼它走真实文件那条路
+
+新增 `scripts/chrome-proot-launcher.py`：装一个 seccomp 过滤器让 `memfd_create`
+返回 ENOSYS，Chromium 于是退回「`/tmp` 里的真实文件」那条路 —— proot 对**真实路径**
+的处理是正确的。启动器还顺手补三件事：
+
+- 自拉 `Xvfb :99`（本驱动**故意用有头模式**，手机上 DSH 进程没有 DISPLAY）
+- 补 `--disable-dev-shm-usage`（手机上 `/dev/shm` 不存在）
+- 补 `--no-sandbox`（Linux 下以 root 跑；只是进程沙箱，不改指纹）
+
+`edge-driver.js` 侧：`isProotLinux()` 自动识别（`PROOT_LOADER` / `PROOT_TMP_DIR` /
+`DSHA_ANDROID_RUNTIME` / `/proc/sys/kernel/osrelease` 含 android），命中就把启动命令
+换成 `python3 <启动器>`，浏览器路径经 `DSH_CHROME_BIN` 传进去。
+**电脑上零改动**（非 Linux 直接短路，Windows 上仍然直接 spawn msedge.exe）。
+`DSH_WEBIN_NO_PROOT_LAUNCHER=1` 可关掉。
+
+`/status` 多一个 `prootLauncher` 字段，一眼能看出走没走启动器。
+
 ## 2026-10-16 · 每个账号可控制「是否在模型选择器显示」
 
 用户要求：「账号UI那里也应该每个账号加上是否在模型选择器显示」。

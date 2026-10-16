@@ -48,6 +48,14 @@ for (const f of REQUIRED) {
   check(`存在 ${f}`, existsSync(join(root, f)), "缺了会导致加载即崩");
 }
 
+// Android/proot 下要靠这个启动器才能把 Chrome 起起来 —— 缺了不会崩，
+// 但手机上必然复现「CDP 端口起来随即 SIGTRAP」那个静默崩溃。
+check(
+  "存在 scripts/chrome-proot-launcher.py",
+  existsSync(join(root, "scripts/chrome-proot-launcher.py")),
+  "缺了 Android/proot 下 Chrome 会静默自杀（DevTools listening 后立刻 SIGTRAP）",
+);
+
 // ── 2. package.json 字段 ────────────────────────────────────
 let pkg = null;
 try {
