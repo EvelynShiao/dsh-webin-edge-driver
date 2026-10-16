@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-10-16 · 修「粘贴登录」两个致命问题 + 账号管理 CLI
+
+### 问题一：注入的 cookie 是**会话 cookie**，浏览器一关登录态就没了
+
+`Network.setCookie` **不给 `expires`** 时，Chromium 把它当**会话 cookie**：
+只活在内存里，**不写进磁盘的 cookie 库**，浏览器一关即丢。
+
+症状（真机实测）：注入后**当次**页面里登录成功（探针在页面里读到登录态），
+但磁盘的 `<profile>/Default/Network/Cookies` 里**根本没有那些 cookie** ⇒
+重启 DSH / 空闲关掉 Edge 之后登录态凭空消失；同一时刻
+`/accounts` 报「未登录」而页面里明明登录着 —— 判据和现实打架，最难查。
+
+**修**：注入时统一给 180 天的过期时间，变成持久 cookie。
+
+### 问题二：Edge 运行期间，cookie 判据**必然**失效
+
+Chromium **独占锁**住 `<profile>/Default/Network/Cookies`，Windows 下连复制
+都拒绝（`EBUSY: resource busy or locked`，重试也没用，只有等 Edge 关掉）。
+而「刚注入完、Edge 还开着」恰恰是最常见的时刻。
+
+**修**（两条一起）：
+1. `readViaCopy` 加**有限重试**（3 次 × 100ms，同步 sleep 用 `Atomics.wait`），
+   覆盖写完短暂加锁的情形；仍拿不到就返回「读不了」，让调用方回退到快照判据
+   —— **绝不因为读不到 cookie 就假装未登录**。
+2. **注入成功后补写一份登录快照**（与「任务跑通后补快照」同一套逻辑）。
+   快照是纯文件、不受锁影响、跨重启存活，门禁立刻就有依据。
+
+### 新增：账号管理 CLI `scripts/accounts.mjs`
+
+设置页 UI 还没做，先用这个顶着（也方便脚本化）：
+
+```
+node scripts/accounts.mjs list
+node scripts/accounts.mjs add <平台> <槽位>          # 中文槽位名可以
+node scripts/accounts.mjs switch <平台> <槽位>
+node scripts/accounts.mjs rm <平台> <槽位>
+node scripts/accounts.mjs import <平台> <槽位> <两行凭据文件> [--login]
+node scripts/accounts.mjs login <平台> <槽位>
+```
+
+`import` 的文件格式就是**两行**（第 1 行 token、第 2 行 cookie），
+**正好兼容桌面那个 `chat.deepseek.com令牌.py` 导出的 `tokens/<名字>.txt`**：
+一条命令就能把 py 里导出的账号搬进插件并登录。
+
+实测（真凭据）：`import deepseek 测试B <py导出的default.txt> --login`
+→ 凭据写入 → 自动新增槽位 → 注入登录 → **✓ 登录成功**，
+且 profile 目录 `edge-ldw/deepseek/测试B/` 与默认槽位**完全隔离**
+（各自的 cookie 库分开落盘）。
+
+⚠️ 刻意**不支持命令行直接传凭据**（会进 shell 历史与进程列表）—— 只从文件读。
+
 ## 2026-10-16 · 中文槽位名支持（槽位名规则收拢到单一模块）
 
 用户要中文账号名（他原来的 py 里就有「奶奶」这类名字）。做完发现这远不止
