@@ -10,6 +10,7 @@ import { isLoggedInByCookies } from "./login-cookie-probe.js";
 import {
 	deleteCredential,
 	describeRotation,
+	getCredential,
 	listCredentials,
 	loadCredentials,
 	saveCredentials,
@@ -72,6 +73,25 @@ const DEEPSEEK = {
 	}],
 	contextWindow: 1048576,
 	maxOutputTokens: 32768,
+	/**
+	* ## 凭据注入参数（2026-10-16，供 `/credentials/inject` 用）
+	*
+	* DeepSeek 的登录态由**两半**组成，缺一不可（真机实验验证）：
+	*
+	*   1. cookie：`smidV2` / `.thumbcache_*` / `HWWAFSESID` / `HWWAFSESTIME`
+	*      / `ds_session_id` —— 从 `document.cookie` 抄得到的那部分
+	*   2. **localStorage `userToken`** —— 值是 appKit 信封
+	*      `{"value":"<56 字符随机串>","__version":"0"}`，**整个信封原样写进去**
+	*
+	* ⚠️ 光有 cookie 不够（真正的 httpOnly 凭据抄不出来）、光有 token 也不够，
+	* 实测**两者一起**才能在一个全新 profile 里直接登进去。
+	*
+	* ⚠️ `cookieUrl` 必须显式给出：cookie 是**依附域**的，不写就没有域可挂。
+	*/
+	credentialInjection: {
+		localStorageKeys: ["userToken"],
+		cookieUrl: "https://chat.deepseek.com/",
+	},
 	reasoningEfforts: [{
 		id: "medium",
 		name: "思考"
@@ -4565,6 +4585,101 @@ async function apply(ctx) {
 				sendJson(res, 200, { ok: true, removed, platform, slot });
 				return;
 			}
+			/**
+			 * ## POST /credentials/inject —— 粘贴凭据直接登录（2026-10-16 新增）
+			 *
+			 * 这是用户点名要的能力：**不必开浏览器扫码**，把 Token/Cookie 灌进去就登。
+			 * 手机和电脑因此能靠同一份凭据文件互相登录。
+			 *
+			 * 真机实验已验证：全新干净 profile + 一份 token/cookie ⇒ 直接进主界面。
+			 *
+			 * body：`{"platform":"deepseek","slot":"default"}` —— 从凭据文件读；
+			 *       也可带 `token`/`cookie` 直接注入（便于「先试着登，成了再存」）。
+			 */
+			if (method === "POST" && pathname === `${API_PREFIX}/credentials/inject`) {
+				const body = await readBody(req);
+				let payload;
+				try {
+					payload = JSON.parse(body === "" ? "{}" : body);
+				} catch {
+					sendJson(res, 400, { ok: false, reason: "invalid-json" });
+					return;
+				}
+				const platform = String(payload?.platform ?? "").trim();
+				const slot = String(payload?.slot ?? "default").trim() || "default";
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(platform) || !/^[A-Za-z0-9_-]{1,64}$/.test(slot)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-platform-or-slot" });
+					return;
+				}
+				/**
+				 * ⚠️ driver 是**串行**的（一次只用一个浏览器干活，这是 webin 的
+				 * 反封设计）。正在跑任务时注入会抢同一个 Edge，必须让用户等一下，
+				 * 而不是并发操作把两边都搞坏。
+				 */
+				if (edgeDriver.busy === true || edgeDriver.stopping === true) {
+					sendJson(res, 409, {
+						ok: false,
+						reason: "driver-busy",
+						message: "Edge 正在跑任务，等它跑完再注入（避免两边抢同一个浏览器）"
+					});
+					return;
+				}
+				const provider = registry.get(platform);
+				if (provider === undefined) {
+					sendJson(res, 404, { ok: false, reason: "unknown-platform", platform });
+					return;
+				}
+				/** 凭据来源：body 优先（试登），否则读文件。 */
+				let token = typeof payload?.token === "string" ? payload.token : "";
+				let cookie = typeof payload?.cookie === "string" ? payload.cookie : "";
+				let fromStore = false;
+				if (token === "" && cookie === "") {
+					const cred = getCredential(platform, slot);
+					if (cred === null) {
+						sendJson(res, 404, {
+							ok: false,
+							reason: "no-credentials",
+							message: `凭据文件里没有 ${platform}#${slot}，先用 PUT ${API_PREFIX}/credentials 写入，或在 body 里直接给 token/cookie。`
+						});
+						return;
+					}
+					token = typeof cred.token === "string" ? cred.token : "";
+					cookie = typeof cred.cookie === "string" ? cred.cookie : "";
+					fromStore = true;
+				}
+				try {
+					const r = await edgeDriver.injectCredentials(provider, { token, cookie, accountId: slot });
+					/**
+					 * 把「验证结果」回填到凭据文件 —— 这就是用户想知道的那个
+					 * 「我的 token 现在还有效吗」：**页面探针说了算**。
+					 */
+					try {
+						const store = loadCredentials();
+						const entry = getCredential(platform, slot, store);
+						if (entry !== null) {
+							entry.lastVerify = { at: Date.now(), ok: r.loggedIn === true, url: r.url };
+							saveCredentials(store);
+						}
+					} catch { /* 回填失败不影响注入结果 */ }
+					log.info?.(`凭据注入 ${platform}#${slot}: loggedIn=${r.loggedIn} cookie=${r.cookieSet} ls=${r.localStorageSet.length}${fromStore ? "（来自凭据文件）" : "（来自请求体）"}`);
+					sendJson(res, r.loggedIn === true ? 200 : 422, {
+						ok: r.loggedIn === true,
+						platform,
+						slot,
+						source: fromStore ? "store" : "body",
+						loggedIn: r.loggedIn,
+						url: r.url,
+						cookieSet: r.cookieSet,
+						cookieFailed: r.cookieFailed,
+						localStorageSet: r.localStorageSet,
+						detail: r.detail
+					});
+				} catch (e) {
+					log.warn?.(`凭据注入失败 ${platform}#${slot}: ${String(e?.message ?? e)}`);
+					sendJson(res, 500, { ok: false, reason: "inject-failed", message: String(e?.message ?? e) });
+				}
+				return;
+			}
 			if (method === "POST" && pathname === `${API_PREFIX}/client/heartbeat`) {
 				const body = await readBody(req);
 				let payload;
@@ -4863,7 +4978,8 @@ async function apply(ctx) {
 						`DELETE ${API_PREFIX}/auth/<slot>/snapshot`,
 						`GET    ${API_PREFIX}/credentials`,
 						`PUT    ${API_PREFIX}/credentials`,
-						`DELETE ${API_PREFIX}/credentials`
+						`DELETE ${API_PREFIX}/credentials`,
+						`POST   ${API_PREFIX}/credentials/inject`
 					]
 				});
 				return;

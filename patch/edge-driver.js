@@ -653,6 +653,135 @@ export class EdgeDriver {
 
   // ── 登录态 / 快照 ──────────────────────────────────────────
 
+  /**
+   * ## 用 Token / Cookie **注入登录**（2026-10-16 真机实验验证可行）
+   *
+   * 用户要的是「粘贴 Token/Cookie 就能登录」，不必开浏览器扫码 ——
+   * 这样手机和电脑才能靠同一份凭据文件互相登录。
+   *
+   * ## 为什么必须走 CDP 注入，而不是去写 cookie 库
+   *
+   * Edge 的 cookie 在磁盘上是**加密的**（DPAPI + AES-GCM，密钥绑当前用户），
+   * 自己拼加密值极其脆弱；而 `Network.setCookie` 是**浏览器自己**写进去的，
+   * 加密/索引/域校验全由它处理，天然正确。localStorage 同理走页面 JS。
+   *
+   * ## 实测证据（干净临时 profile，只灌 token+cookie）
+   *
+   * | 阶段 | 页面 |
+   * |---|---|
+   * | 注入前 | URL 停在 `/sign_in`，「+86 发送验证码 / 微信扫码」 |
+   * | 注入后 | URL 变成 `chat.deepseek.com`，正文出现昵称与「开启新对话」 |
+   *
+   * 也就是说：**全新 profile + 一份 token/cookie = 直接登进去**，无需扫码。
+   *
+   * ## 参数从哪来（全部可在 provider JSON 里覆盖）
+   *
+   *   - `credentialInjection.localStorageKeys`：要写哪些 localStorage 键
+   *     （DeepSeek 是 `userToken`；值要用**原始信封串** `{"value":"..."}`，
+   *     因为页面读的就是这个格式）
+   *   - `credentialInjection.cookieUrl`：cookie 挂到哪个 URL 上
+   *     （默认取 `homeUrl` 的 origin；**必须先导航到该域**，否则没有 origin 可挂）
+   *
+   * @returns {Promise<{ok:boolean,loggedIn:boolean,url:string,cookieSet:number,cookieFailed:string[],localStorageSet:string[],detail:string}>}
+   */
+  async injectCredentials(provider, { token = "", cookie = "", accountId = "default" } = {}) {
+    const platformId = provider?.id ?? this.platformId;
+    const inj = provider?.credentialInjection ?? {};
+    const home = provider?.homeUrl ?? "https://chat.deepseek.com/";
+    let origin = home;
+    try { origin = new URL(home).origin; } catch { /* 配错就用原样 */ }
+
+    /** ⚠️ 传 accountId：多账号是**一槽位一 profile**，注入必须落到目标槽位。 */
+    await this.ensureEdge(platformId, accountId);
+    const conn = this.conn;
+    if (conn === null || conn.closed !== false) throw new Error("CDP 未连接，无法注入");
+
+    /**
+     * ⚠️ 必须先导航到目标域：`Network.setCookie` 与 `localStorage` 都**依附于
+     * origin**。停在 about:blank 时既没有域可挂 cookie，localStorage 也是
+     * 另一个 origin 的（写了等于没写）。实测踩过。
+     */
+    await this.goto(home);
+    await sleep(2500);
+
+    await conn.send("Network.enable", {}, 8000).catch(() => undefined);
+
+    // ── ① cookie ──────────────────────────────────────────────
+    const cookieUrl = typeof inj.cookieUrl === "string" && inj.cookieUrl !== "" ? inj.cookieUrl : origin;
+    const pairs = [];
+    for (const part of String(cookie ?? "").split(";")) {
+      const seg = part.trim();
+      if (seg === "") continue;
+      const i = seg.indexOf("=");
+      if (i <= 0) continue;
+      pairs.push({ name: seg.slice(0, i).trim(), value: seg.slice(i + 1).trim() });
+    }
+    let cookieSet = 0;
+    const cookieFailed = [];
+    for (const p of pairs) {
+      try {
+        const r = await conn.send("Network.setCookie", {
+          name: p.name,
+          value: p.value,
+          url: cookieUrl,
+          path: "/",
+          secure: true,
+          /**
+           * ⚠️ `httpOnly: false` 是**刻意**的：我们注入的是用户从
+           * `document.cookie` 抄来的那份（js 可见的那些）。真正的 httpOnly
+           * 凭据抄不出来，只能靠 token 那一半补 —— 实测两者一起就够登录。
+           */
+          httpOnly: false,
+          sameSite: "Lax",
+        }, 8000);
+        if (r?.success === true) cookieSet++;
+        else cookieFailed.push(p.name);
+      } catch {
+        cookieFailed.push(p.name);
+      }
+    }
+
+    // ── ② localStorage ────────────────────────────────────────
+    const keys = Array.isArray(inj.localStorageKeys) ? inj.localStorageKeys : [];
+    const localStorageSet = [];
+    if (token !== "" && keys.length > 0) {
+      const spec = JSON.stringify(keys);
+      const val = JSON.stringify(token);
+      const r = await this.evalInPage(`(() => {
+        const keys=${spec}; const v=${val};
+        const done=[];
+        for (const k of keys) { try { localStorage.setItem(k, v); done.push(k); } catch(e) {} }
+        return JSON.stringify(done);
+      })()`, 12000).catch(() => null);
+      try { localStorageSet.push(...JSON.parse(String(r))); } catch { /* 拿不到就算了 */ }
+    }
+
+    // ── ③ reload 让页面带上新凭据重新初始化 ────────────────────
+    await conn.send("Page.reload", { ignoreCache: true }, 10000).catch(() => undefined);
+    await sleep(6000);
+
+    // ── ④ 用**现成的登录探针**验证（这就是「token 还能不能用」的答案）──
+    let probe = { loggedIn: false };
+    for (let i = 0; i < 3; i++) {
+      probe = await this.probe(provider);
+      if (probe.loggedIn === true) break;
+      await sleep(3500);
+    }
+    const url = String(await this.evalInPage("location.href", 8000).catch(() => ""));
+
+    return {
+      ok: probe.loggedIn === true,
+      loggedIn: probe.loggedIn === true,
+      url,
+      cookieSet,
+      cookieFailed,
+      localStorageSet,
+      detail: probe.loggedIn === true
+        ? "注入成功，页面登录探针已确认"
+        : `注入后仍未通过登录探针（cookie 成功 ${cookieSet}/${pairs.length}${cookieFailed.length ? `，失败 ${cookieFailed.join("/")}` : ""}；localStorage 写入 ${localStorageSet.length} 项）—— 凭据可能已过期`,
+    };
+  }
+
   async probe(provider = this.getProvider(this.platformId)) {
     // DeepSeek 原生登录探针只适用于 DeepSeek；其它站点必须声明经实测的 authProbe。
     if (provider?.id === "deepseek") {

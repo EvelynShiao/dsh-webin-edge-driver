@@ -1,5 +1,55 @@
 # Changelog
 
+## 2026-10-16 · 粘贴 Token/Cookie 直接登录（`/credentials/inject`）
+
+**用户点名要的能力**：不必开浏览器扫码，把 Token/Cookie 灌进去就登 ——
+这样手机和电脑才能靠同一份凭据文件互相登录。
+
+### 关键实验（先证实再实现）
+
+干净临时 profile + 一份 token/cookie：
+
+| 阶段 | 页面 |
+|---|---|
+| 注入前 | URL 停在 `/sign_in`，「+86 发送验证码 / 微信扫码」 |
+| 注入后 | URL 变 `chat.deepseek.com`，正文出现昵称与「开启新对话」 |
+
+⇒ **全新 profile + 凭据 = 直接登进去，无需扫码**。方案可行。
+
+### 实现
+
+- `EdgeDriver.injectCredentials(provider, {token, cookie, accountId})`：
+  ① 先导航到目标域（`Network.setCookie` 与 `localStorage` 都依附 origin，
+  停在 about:blank 写了等于没写）→ ② `Network.setCookie` 逐条灌 cookie
+  → ③ 页面 JS 写 `localStorage`（值用**原始 appKit 信封**）
+  → ④ reload → ⑤ **用现成的登录探针验证**（这就是「token 还能用吗」的答案）。
+- `POST /dsh-webin/api/credentials/inject`，body `{platform, slot}`（从凭据文件读）
+  或直接带 `token`/`cookie`（便于「先试着登，成了再存」）。
+  验证结果**回填** `lastVerify` 到凭据文件。driver 忙时返回 409（串行设计，不抢浏览器）。
+- provider 可声明 `credentialInjection: { localStorageKeys, cookieUrl }`；DeepSeek 已声明。
+
+### 为什么走 CDP 注入而不是写 cookie 库
+
+Edge 磁盘上的 cookie 是**加密的**（DPAPI + AES-GCM，密钥绑当前用户），自己拼加密值
+极脆；而 `Network.setCookie` 是**浏览器自己**写进去的，加密/索引/域校验全由它处理。
+
+### 为什么两半都必需
+
+DeepSeek 登录态 = cookie（`smidV2` / `.thumbcache_*` / `HWWAFSESID` / `HWWAFSESTIME`
+/ `ds_session_id`）+ **localStorage `userToken`**。光有 cookie 不够（真正的 httpOnly
+凭据从 `document.cookie` 抄不出来）、光有 token 也不够 —— 实测**两者一起**才能登。
+
+### 实测（真调用生产代码，非复刻逻辑）
+
+用临时 profile + 独立端口调用 `EdgeDriver.injectCredentials()`：
+
+```
+ok: true, loggedIn: true, url: https://chat.deepseek.com/
+cookieSet: 5/5   localStorageSet: ["userToken"]
+detail: 注入成功，页面登录探针已确认
+耗时: 13.7s
+```
+
 ## 2026-10-16 · 统一 Token/Cookie 凭据文件 + 自定义平台修复
 
 ### 新增：`lib/credential-store.js` + `/credentials` 接口
