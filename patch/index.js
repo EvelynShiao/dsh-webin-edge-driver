@@ -7,6 +7,15 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { EdgeDriver, EDGE_DRIVER_DEFAULTS } from "./edge-driver.js";
 import { isLoggedInByCookies } from "./login-cookie-probe.js";
+import {
+	deleteCredential,
+	describeRotation,
+	listCredentials,
+	loadCredentials,
+	saveCredentials,
+	setCredential,
+	storePath,
+} from "./credential-store.js";
 //#region src/shared/providers.ts
 /**
 * DeepSeek 网页版。
@@ -4468,6 +4477,94 @@ async function apply(ctx) {
 				sendJson(res, 200, { ok: true, platform: platformId, slot, slots, active, snapshotRemoved });
 				return;
 			}
+			/**
+			 * ## /credentials —— 统一 Token/Cookie 凭据文件（2026-10-16 新增）
+			 *
+			 * 用户要「一个文件，手机和电脑都能用」地管 Token/Cookie。
+			 * 文件在 `~/.dsh/webin/credentials.json`（可用环境变量
+			 * `DSH_WEBIN_CREDENTIALS` 指到同步目录，实现手机+电脑共用）。
+			 *
+			 * ⚠️ **GET 一律脱敏**：只回长度/指纹/轮换频率，**绝不回明文**。
+			 * 明文只有在用户自己打开那个文件时才看得到 —— 这是防误泄露的第一道闸。
+			 */
+			if (method === "GET" && pathname === `${API_PREFIX}/credentials`) {
+				const store = loadCredentials();
+				sendJson(res, 200, {
+					ok: true,
+					path: storePath(),
+					accounts: listCredentials(store),
+					/** 给用户看「怎么写进去」的最小说明。 */
+					hint: "直接编辑该文件，或用 PUT /dsh-webin/api/credentials 写入；环境变量 DSH_WEBIN_CREDENTIALS 可换路径（手机/电脑共用一个文件）。"
+				});
+				return;
+			}
+			if (method === "PUT" && pathname === `${API_PREFIX}/credentials`) {
+				const body = await readBody(req);
+				let payload;
+				try {
+					payload = JSON.parse(body);
+				} catch {
+					sendJson(res, 400, { ok: false, reason: "invalid-json" });
+					return;
+				}
+				const platform = String(payload?.platform ?? "").trim();
+				const slot = String(payload?.slot ?? "default").trim() || "default";
+				/** 与槽位文件同一套字符约束，防止路径穿越与非法目录名。 */
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(platform)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-platform", message: "platform 只允许字母数字下划线连字符（1~64 位）" });
+					return;
+				}
+				if (!/^[A-Za-z0-9_-]{1,64}$/.test(slot)) {
+					sendJson(res, 400, { ok: false, reason: "invalid-slot", message: "slot 只允许字母数字下划线连字符（1~64 位）" });
+					return;
+				}
+				if (typeof payload?.token !== "string" && typeof payload?.cookie !== "string") {
+					sendJson(res, 400, { ok: false, reason: "nothing-to-set", message: "token 与 cookie 至少要给一个" });
+					return;
+				}
+				const store = loadCredentials();
+				const entry = setCredential(platform, slot, {
+					...(typeof payload.token === "string" ? { token: payload.token } : {}),
+					...(typeof payload.cookie === "string" ? { cookie: payload.cookie } : {}),
+				}, store);
+				const savedTo = saveCredentials(store);
+				/**
+				 * ⚠️ 日志**只记长度**，不记内容 —— 凭据进日志等于泄露。
+				 */
+				log.info?.(`凭据已写入：${platform}#${slot}（token ${entry.tokenLen} / cookie ${entry.cookieLen} 字符，变更 ${entry.changedCount} 次）`);
+				sendJson(res, 200, {
+					ok: true,
+					path: savedTo,
+					account: {
+						platform, slot,
+						tokenLen: entry.tokenLen,
+						cookieLen: entry.cookieLen,
+						changedCount: entry.changedCount,
+						rotation: describeRotation(entry)
+					}
+				});
+				return;
+			}
+			if (method === "DELETE" && pathname === `${API_PREFIX}/credentials`) {
+				const body = await readBody(req);
+				let payload;
+				try {
+					payload = JSON.parse(body);
+				} catch {
+					sendJson(res, 400, { ok: false, reason: "invalid-json" });
+					return;
+				}
+				const platform = String(payload?.platform ?? "").trim();
+				const slot = String(payload?.slot ?? "default").trim() || "default";
+				const store = loadCredentials();
+				const removed = deleteCredential(platform, slot, store);
+				if (removed) {
+					saveCredentials(store);
+					log.info?.(`凭据已删除：${platform}#${slot}`);
+				}
+				sendJson(res, 200, { ok: true, removed, platform, slot });
+				return;
+			}
 			if (method === "POST" && pathname === `${API_PREFIX}/client/heartbeat`) {
 				const body = await readBody(req);
 				let payload;
@@ -4763,7 +4860,10 @@ async function apply(ctx) {
 						`GET    ${API_PREFIX}/auth`,
 						`GET    ${API_PREFIX}/auth/<slot>/snapshot`,
 						`PUT    ${API_PREFIX}/auth/<slot>/snapshot`,
-						`DELETE ${API_PREFIX}/auth/<slot>/snapshot`
+						`DELETE ${API_PREFIX}/auth/<slot>/snapshot`,
+						`GET    ${API_PREFIX}/credentials`,
+						`PUT    ${API_PREFIX}/credentials`,
+						`DELETE ${API_PREFIX}/credentials`
 					]
 				});
 				return;

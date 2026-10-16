@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-10-16 · 统一 Token/Cookie 凭据文件 + 自定义平台修复
+
+### 新增：`lib/credential-store.js` + `/credentials` 接口
+
+用户要「一个文件，手机和电脑都能用」地管各平台 Token/Cookie，并且**能看出会不会过期**。
+
+- 文件：`~/.dsh/webin/credentials.json`（**原子写**：先写 `.tmp` 再 rename，
+  防止手机端同步到半截文件）；环境变量 `DSH_WEBIN_CREDENTIALS` 可指到同步目录。
+- 接口：`GET/PUT/DELETE /dsh-webin/api/credentials`。
+  **GET 一律脱敏**（只回长度/指纹/轮换频率，绝不回明文）；日志也只记长度。
+- **过期判断的诚实结论**：DeepSeek 的 `userToken` 实测是 56 字符**不透明随机串**
+  （`{"value":"...","__version":"0"}`）、**不是 JWT**，解不出 `exp`。
+  所以只有两条真判据：① 注入后用页面登录探针验证 ② **记录轮换频率**
+  （`changedCount` + `describeRotation()`，回答「这站多久轮一次」）。
+- 已把桌面 `chat.deepseek.com令牌.py` 的 `tokens/*.txt` **迁移进来**（含它积累的
+  轮换历史，那是最值钱的部分）。
+
+### 修复：自定义平台原来**根本用不了**
+
+用户问「那个自定义平台能用吧」——实测三道 brick：
+
+1. `isLoggedInByCookies` 对未知 id 返回 `no-rule` ⇒ 门禁永远 false
+   ⇒ `listModels` 不列模型、`streamOnce` 直接报未登录。
+   **修**：门禁在 `no-rule`（= 自定义平台，我们没有判据）时 **fail-open 放行**；
+   `no-login-cookie` 与 `profile-unreadable` 仍保持 false，内置四站不受影响。
+2. `probe()` 对无 `authProbe` 的 provider 返回 `{unsupported:true}`
+   ⇒ `runJob` 抛 `WEBIN_NOT_LOGGED_IN` 并把窗口叫前台。
+   **修**：退化为「`input.selectors` 任一可见即算登录」（失败方向安全，
+   真没登录时后续步骤会报更具体的原因）。
+3. `provider.example.json` 缺 `replyCapture` / `authProbe` / `loginProbe`
+   ⇒ 照示例配出来的平台会被「没配回复选择器」守卫拒发。**示例已补齐**。
+
+### 修复：cookie 判据偶发失效
+
+Chromium cookie 库是 **WAL 模式**，Edge 开着时「只读打开」会**时好时坏**
+（实测同一千问 profile：手工试能读 27 条，插件跑报 `unable to open database file`）。
+加回退：复制 `Cookies`+`-wal`+`-shm` 到 `~/.dsh/webin/cache/cookies/<hash>/` 再读副本。
+连跑 3 轮全通。⚠️ `db` 必须 `close()`，否则 Windows 删临时目录报 `EPERM`（踩过）。
+
+### 修复：`/accounts` 槽位登录态
+
+原只看快照 ⇒ 设置页显示未登录。改用与 `isPlatformLoggedIn` 一致的双判据
+（快照 **或** cookie），并回传 `via` / `cookie` 便于排查。
+
+### 安装脚本
+
+`install.ps1` 的文件清单补上 `login-cookie-probe.js` / `credential-store.js`
+（index.js 会 import，漏装=加载即崩）；`provider.example.json` 单独放到插件根目录。
+
 ## 2026-10-16 · 修「明明登录了却说未登录」死锁（多账号 profile 撞车 + cookie 判据）
 
 **用户报的现象**：元宝（以及千问 / 豆包）在 Edge 里明明是登录状态，插件一直说没登录，消息发不出去。

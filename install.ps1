@@ -64,14 +64,22 @@ Ok "备份完成（$n 个文件）"
 
 # ── 2. 放文件（整文件覆盖 —— 补丁版 lib 已含全部改动，天然幂等） ──
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-# ⚠️ login-cookie-probe.js 是 2026-10-16 新增的模块（读 Edge profile cookie
-#    判登录态，破「未登录快照 ⇒ 任务不入队 ⇒ 快照写不出」死锁）。
-#    index.js 会 import 它 —— 漏装会让插件**加载即崩**，所以必须在清单里。
-foreach ($f in @('edge-driver.js','edge-driver-scripts.js','index.js','client.js','login-cookie-probe.js')) {
+# ⚠️ 下面两个是 index.js 会 import 的**新模块**，必须一起装 ——
+#    漏装会让插件**加载即崩**（import 解析失败，provider 全不注册）：
+#      · login-cookie-probe.js  读 Edge profile cookie 判登录态（破死锁）
+#      · credential-store.js    统一 Token/Cookie 凭据文件（手机+电脑共用）
+foreach ($f in @('edge-driver.js','edge-driver-scripts.js','index.js','client.js','login-cookie-probe.js','credential-store.js')) {
     $src = Join-Path $here "patch\$f"
     if (-not (Test-Path $src)) { Die "缺少 patch\$f" }
     Copy-Item $src (Join-Path $libDir $f) -Force
     Ok "放入 lib\$f"
+}
+# provider.example.json 在**插件根目录**（不在 lib\），单独放 ——
+# 它是自定义平台的配置模板，缺了用户就没有带 replyCapture/authProbe 的范本可抄。
+$exSrc = Join-Path $here "patch\provider.example.json"
+if (Test-Path $exSrc) {
+    Copy-Item $exSrc (Join-Path $PluginDir "provider.example.json") -Force
+    Ok "放入 provider.example.json"
 }
 
 # ── 4. config.json ──────────────────────────────────────────
