@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-10-16 · 修「点进去只看到 DeepSeek」+「加号只能打开 DeepSeek」
+
+用户报的两条，都是**我上一轮没做全**：
+
+### ① 点进去只列 DeepSeek 账号
+
+py 启动时打的那张「账号状况」表是**本脚本自己的**账号（都来自 deepseek-profiles），
+所以天生只有 DeepSeek。现在在 \`main()\` 开头补一次 \`plugin_list()\` ——
+进去就能同时看到**插件里的全部平台账号**（实测：deepseek default / deepseek Evelyn /
+yuanbao default / doubao default，带登录态与当前标记）。
+
+### ② \`+ <名字> <平台>\` 只能打开 DeepSeek
+
+根因：py 原有的 \`launch()\` 把 URL **写死**成 chat.deepseek.com、
+profile 也写死成 deepseek-profiles ⇒ 元宝/豆包压根没法用它登录。
+（我上一轮对非 deepseek 只是「建个槽位，让你自己去插件设置页登」—— 等于没做。）
+
+新增 \`plugin_open_login()\`：
+
+- profile 用**插件的**目录 \`edge-ldw/<平台>/<槽位>\`（与 slot-names.js /
+  userDataDirFor 的规则严格一致，default 槽位不拼账号层）
+  ⇒ **登录态直接落在插件要用的地方，登完就能用，不需要再「推」凭据**。
+- 地址按平台映射：deepseek / yuanbao / doubao。
+- 调试端口 \`port_for("plugin|<平台>#<槽位>")\`，与 py 自己的账号端口不冲突。
+
+实测：\`+ 测试元宝 yuanbao\` → 建好槽位 → 弹出窗口指向
+\`https://yuanbao.tencent.com/\`、profile 为 \`edge-ldw\yuanbao\测试元宝\`、
+端口 17495（进程确实起来了）。
+
 ## 2026-10-16 · 修「推了却看不见」+ 对比指纹 + py 账号改名整理
 
 ### 真 bug：`推` 只写凭据、**没注册槽位** ⇒ 设置页看不见
