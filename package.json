@@ -22,7 +22,8 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "verify": "node scripts/verify-package.mjs"
+    "verify": "node scripts/verify-package.mjs",
+    "test": "node scripts/test-slot-names.mjs"
   },
   "license": "Apache-2.0",
   "repository": {

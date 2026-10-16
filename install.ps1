@@ -58,8 +58,8 @@ if (-not (Test-Path $PluginDir)) { Die "找不到插件目录。dsh-webin 装了
 $dstLib = Join-Path $PluginDir 'lib'
 if (-not (Test-Path $dstLib)) { Die "插件目录里没有 lib\ —— 这不像 dsh-webin 的安装" }
 
-# 必须的文件（缺任何一个都会让插件加载即崩）
-$need = @('index.js','client.js','edge-driver.js','edge-driver-scripts.js','login-cookie-probe.js','credential-store.js','session-gc.js')
+# 必须的文件（缺任何一个都会让插件加载即崩 —— import 解析失败，provider 全不注册）
+$need = @('index.js','client.js','edge-driver.js','edge-driver-scripts.js','login-cookie-probe.js','credential-store.js','session-gc.js','slot-names.js')
 foreach ($f in $need) {
     if (-not (Test-Path (Join-Path $srcLib $f))) { Die "源目录缺少 lib\$f" }
 }

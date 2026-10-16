@@ -42,6 +42,7 @@ const REQUIRED = [
   "lib/login-cookie-probe.js",
   "lib/credential-store.js",
   "lib/session-gc.js",
+  "lib/slot-names.js",
 ];
 for (const f of REQUIRED) {
   check(`存在 ${f}`, existsSync(join(root, f)), "缺了会导致加载即崩");
