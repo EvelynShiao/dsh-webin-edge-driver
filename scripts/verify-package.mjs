@@ -40,6 +40,7 @@ const REQUIRED = [
   "lib/edge-driver.js",
   "lib/edge-driver-scripts.js",
   "lib/login-cookie-probe.js",
+  "lib/login-cookie-probe-worker.js",
   "lib/credential-store.js",
   "lib/session-gc.js",
   "lib/slot-names.js",

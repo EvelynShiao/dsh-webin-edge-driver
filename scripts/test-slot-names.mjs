@@ -6,6 +6,7 @@
  * （commit 2cf780f 修过一次：白名单漏了分隔符 `#`，所有槽位全落到同一个文件）。
  * 所以规则改动后必须跑这个。
  */
+import { join, resolve } from "node:path";
 import {
   SLOT_MAX_LEN,
   isSafeSlotName,
@@ -83,19 +84,20 @@ eq("四个槽位四个文件", uniq.size, 4);
  * `safePathSegment` 之后，这里至少把 driver 那侧真跑一遍。
  */
 const { EdgeDriver, EDGE_DRIVER_DEFAULTS } = await import("../lib/edge-driver.js");
+const profileRoot = resolve("fake-ldw");
 const drv = new EdgeDriver({
-  config: { ...EDGE_DRIVER_DEFAULTS, enabled: false, userDataDir: "X:\\fake-ldw" },
+  config: { ...EDGE_DRIVER_DEFAULTS, enabled: false, userDataDir: profileRoot },
   log: { info() {}, warn() {}, debug() {} },
   getProvider: () => undefined,
 });
 const dir = (slot) => drv.userDataDirFor("deepseek", slot);
-eq("default 槽位不拼账号层", dir("default"), "X:\\fake-ldw\\deepseek");
-eq("中文槽位被保留", dir("奶奶"), "X:\\fake-ldw\\deepseek\\奶奶");
+eq("default 槽位不拼账号层", dir("default"), join(profileRoot, "deepseek"));
+eq("中文槽位被保留", dir("奶奶"), join(profileRoot, "deepseek", "奶奶"));
 eq("两个中文槽位不撞车", dir("奶奶") === dir("爷爷"), false);
-eq("英文槽位照常", dir("work"), "X:\\fake-ldw\\deepseek\\work");
+eq("英文槽位照常", dir("work"), join(profileRoot, "deepseek", "work"));
 /** 危险字符即使绕过入口校验，也不会造出目录层级。 */
-eq("斜杠不会造层级", dir("a/b"), "X:\\fake-ldw\\deepseek\\a_b");
-eq("穿越不会逃逸", dir(".."), "X:\\fake-ldw\\deepseek");
+eq("斜杠不会造层级", dir("a/b"), join(profileRoot, "deepseek", "a_b"));
+eq("穿越不会逃逸", dir(".."), join(profileRoot, "deepseek"));
 
 // ── 输出 ────────────────────────────────────────────────────
 console.log("\n槽位名规则测试\n" + "─".repeat(56));

@@ -1,0 +1,3 @@
+// Synthetic blocked worker: no profile access. Parent must timeout/terminate it.
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000));
