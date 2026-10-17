@@ -119,6 +119,16 @@ try {
     assert.notEqual(a, b);
     console.log('PASS: 合成发送入队/领取/回复结算与两新会话隔离（未调用真实模型）');
   }
+  // 账号改名：槽位、active 一起改（迁移逻辑在真机已验证，这里只测配置改对）
+  {
+    await request('accounts', 'PUT', { platform: 'deepseek', slots: ['work'], active: 'work' });
+    const renamed = await request('accounts/rename', 'POST', { platform: 'deepseek', from: 'work', to: 'evelyn-deepseek' });
+    assert.equal(renamed.ok, true);
+    const after = (await request('accounts')).platforms.find(p => p.platform === 'deepseek');
+    assert.deepEqual(after.slots, ['evelyn-deepseek']);
+    assert.equal(after.active, 'evelyn-deepseek');
+    console.log('PASS: 账号改名（槽位与 active 同步更新）');
+  }
   console.log('PASS: 账号新增/切换/持久化与模型隐藏/恢复（隔离真实handler）');
   console.log(JSON.stringify({ indexInjectionCount: taps.length, adapterRoutes: [...adapters.keys()] }));
   assert.equal(taps.length, 0, '插件不得注入整页自动刷新脚本');
