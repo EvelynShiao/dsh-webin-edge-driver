@@ -107,6 +107,18 @@ try {
     assert.notEqual(a, b);
     console.log('PASS: 合成发送入队/领取/回复结算与两新会话隔离（未调用真实模型）');
   }
+  // 自动化设置：保存 → 读回 → 非法枚举回退
+  const baseCfg = (await request('config')).config;
+  await request('config', 'PUT', { ...baseCfg, autoOpenOnStart: true, autoOpenPlatform: 'doubao', autoFreshChatOnStart: true, browserIdleCloseSeconds: 600, chatDeleteAfterSeconds: 120 });
+  const saved = (await request('config')).config;
+  assert.equal(saved.autoOpenOnStart, true);
+  assert.equal(saved.autoOpenPlatform, 'doubao');
+  assert.equal(saved.autoFreshChatOnStart, true);
+  assert.equal(saved.browserIdleCloseSeconds, 600);
+  assert.equal(saved.chatDeleteAfterSeconds, 120);
+  await request('config', 'PUT', { ...saved, autoOpenPlatform: '不存在的平台' });
+  assert.equal((await request('config')).config.autoOpenPlatform, 'deepseek', '非法平台名必须回退默认');
+  console.log('PASS: 自动化设置保存/读回/非法值回退');
   console.log('PASS: 账号新增/切换/持久化与模型隐藏/恢复（隔离真实handler）');
   console.log(JSON.stringify({ indexInjectionCount: taps.length, adapterRoutes: [...adapters.keys()] }));
   assert.equal(taps.length, 0, '插件不得注入整页自动刷新脚本');
