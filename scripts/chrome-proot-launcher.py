@@ -141,50 +141,6 @@ def block_memfd_create():
 
 
 # ── 有头模式要一块屏幕 ─────────────────────────────────────────────
-def _x_socket_alive(n):
-    """**真的去连一下** X 的 unix socket。
-
-    ⚠️ 不能只看 /tmp/.X<n>-lock 是否存在 —— 上一只 Xvfb 被杀之后 lock 和 socket
-    文件都会留在原地，只看文件就会把「尸体」当成活的，于是跳过启动 Xvfb、
-    DISPLAY 指向一个没人监听的 socket，Chrome 连不上 X server 直接秒退。
-    （2026-10-16 实测踩到：驱动报「CDP 端口没起来」，真因就是这个。）
-    """
-    path = f"/tmp/.X11-unix/X{n}"
-    if not os.path.exists(path):
-        return False
-    import socket
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.settimeout(1.0)
-        s.connect(path)
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
-
-
-def _spawn_xvfb(n):
-    try:
-        pid = os.fork()
-        if pid == 0:
-            os.setsid()
-            devnull = os.open(os.devnull, os.O_RDWR)
-            os.dup2(devnull, 0)
-            os.dup2(devnull, 1)
-            os.dup2(devnull, 2)
-            os.execv("/usr/bin/Xvfb", ["Xvfb", f":{n}", "-screen", "0", "1280x900x24"])
-            os._exit(127)
-    except OSError:
-        return False
-    import time
-    for _ in range(80):  # 最多等 8 秒
-        if _x_socket_alive(n):
-            return True
-        time.sleep(0.1)
-    return False
-
-
 def ensure_display(args):
     """驱动刻意用有头模式（--headless 是典型机器人特征），手机上得自己拉 Xvfb。
 
@@ -197,23 +153,28 @@ def ensure_display(args):
     if not os.path.exists("/usr/bin/Xvfb"):
         sys.stderr.write("[proot-launcher] 无 DISPLAY 且没装 Xvfb，有头模式可能起不来\n")
         return
-
-    for n in (99, 98, 97, 96):
-        if _x_socket_alive(n):
-            os.environ["DISPLAY"] = f":{n}"
-            sys.stderr.write(f"[proot-launcher] 复用已有 DISPLAY=:{n}\n")
+    disp = ":99"
+    if not os.path.exists("/tmp/.X99-lock"):
+        try:
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()
+                devnull = os.open(os.devnull, os.O_RDWR)
+                os.dup2(devnull, 0)
+                os.dup2(devnull, 1)
+                os.dup2(devnull, 2)
+                os.execv("/usr/bin/Xvfb", ["Xvfb", disp, "-screen", "0", "1280x900x24"])
+                os._exit(127)
+        except OSError as exc:
+            sys.stderr.write(f"[proot-launcher] 起 Xvfb 失败：{exc}\n")
             return
-        # 连不上的 lock / socket 都是上次留下的尸体，清掉（不清 Xvfb 会拒绝启动）
-        for junk in (f"/tmp/.X{n}-lock", f"/tmp/.X11-unix/X{n}"):
-            try:
-                os.unlink(junk)
-            except OSError:
-                pass
-        if _spawn_xvfb(n):
-            os.environ["DISPLAY"] = f":{n}"
-            sys.stderr.write(f"[proot-launcher] DISPLAY=:{n}（自拉 Xvfb）\n")
-            return
-    sys.stderr.write("[proot-launcher] Xvfb 起不来，有头模式可能失败\n")
+        import time
+        for _ in range(60):  # 等 socket 就绪，最多 6 秒
+            if os.path.exists("/tmp/.X11-unix/X99"):
+                break
+            time.sleep(0.1)
+    os.environ["DISPLAY"] = disp
+    sys.stderr.write(f"[proot-launcher] DISPLAY={disp}（自拉 Xvfb）\n")
 
 
 def main():
