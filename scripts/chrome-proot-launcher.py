@@ -56,6 +56,7 @@ import ctypes
 import errno
 import glob
 import os
+import socket
 import struct
 import sys
 
@@ -140,6 +141,25 @@ def block_memfd_create():
         return False
 
 
+def x_display_alive(display_no):
+    """显示号真的活着吗？（只看锁文件会误判 —— 锁会残留，进程可能早死了）
+
+    判据：连一下 `/tmp/.X11-unix/X<n>` 的 unix socket。
+    连得上才算活着；连不上就当作「没有显示」，由调用方清锁重拉。
+    """
+    path = f"/tmp/.X11-unix/X{display_no}"
+    if not os.path.exists(path):
+        return False
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        sock.connect(path)
+        sock.close()
+        return True
+    except Exception:
+        return False
+
+
 # ── 有头模式要一块屏幕 ─────────────────────────────────────────────
 def ensure_display(args):
     """驱动刻意用有头模式（--headless 是典型机器人特征），手机上得自己拉 Xvfb。
@@ -154,7 +174,15 @@ def ensure_display(args):
         sys.stderr.write("[proot-launcher] 无 DISPLAY 且没装 Xvfb，有头模式可能起不来\n")
         return
     disp = ":99"
-    if not os.path.exists("/tmp/.X99-lock"):
+    if not x_display_alive(99):
+        # 锁文件可能来自一个已经被杀掉的 Xvfb（真机 2026-10-17 踩到：
+        # 锁还在 ⇒ 这里跳过启动 ⇒ Chrome 报 Missing X server 直接退出 ⇒
+        # 插件反复启动浏览器、消息 20 秒没人领）。
+        # 先探 socket，确认服务真的活着；死了就清掉陈旧锁重新拉起。
+        try:
+            os.unlink("/tmp/.X99-lock")
+        except OSError:
+            pass
         try:
             pid = os.fork()
             if pid == 0:
