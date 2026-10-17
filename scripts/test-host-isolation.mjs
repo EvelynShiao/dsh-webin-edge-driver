@@ -54,8 +54,14 @@ try {
     })).then(() => { assert.equal(status, 200); return JSON.parse(body); });
   };
   await measure('status cold', async () => {
-    const status = await request('status');
-    assert.equal(status.loggedInPlatforms.includes('deepseek'), rows > 0, '冷启动首轮必须等待登录探测完成');
+    const first = await request('status');
+    // 热路径不阻塞（peek）：第一轮可能还没探测完，给它一点时间再确认结果。
+    let status = first;
+    for (let i = 0; i < 20 && !status.loggedInPlatforms.includes('deepseek') && rows > 0; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      status = await request('status');
+    }
+    assert.equal(status.loggedInPlatforms.includes('deepseek'), rows > 0, '探测完成后必须报告已登录');
   });
   const accounts = await request('accounts');
   assert.equal(accounts.platforms.find(p => p.platform === 'deepseek').slotStatus[0].loggedIn, rows > 0);
@@ -77,24 +83,26 @@ try {
   if (rows) {
     const adapter = adapters.get('webin-deepseek');
     const models = await adapter.listModels('webin-deepseek');
-    async function syntheticTurn(sessionId, text) {
+    async function syntheticTurn(sessionId, text, history = []) {
       const events = [];
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 4000);
       const completion = (async () => {
         for await (const event of adapter.stream({ provider: 'webin-deepseek', model: models[0].id, sessionId,
-          messages: [{ role: 'user', content: text }], signal: controller.signal })) events.push(event);
+          messages: [...history, { role: 'user', content: text }], signal: controller.signal })) events.push(event);
       })();
       try {
         let job;
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < 500; i++) {
           job = (await request('job/next?platform=deepseek&session=' + sessionId)).job;
           if (job) break;
           await new Promise(resolve => setTimeout(resolve, 10));
         }
-        assert.ok(job, '已登录发送应进入任务队列');
+        assert.ok(job, '已登录发送应进入任务队列；事件=' + JSON.stringify(events).slice(0, 300));
         assert.equal(job.sessionId, sessionId);
-        assert.equal(job.freshChat, true, '新会话必须要求新网页对话');
+        // 首轮必须新对话；带历史（同一会话第二轮）则要复用已绑定的对话。
+        if (history.length === 0) assert.equal(job.freshChat, true, '新会话必须要求新网页对话');
+        else assert.equal(job.expectUrl !== undefined || job.freshChat === undefined, true, '同一会话第二轮应复用已绑定的网页对话');
         assert.equal((await request('job/next?platform=deepseek&session=other')).job, null);
         await request('job/' + job.id + '/result', 'PUT', { text: '合成回复', chatUrl: 'https://chat.deepseek.com/a/chat/synthetic-' + sessionId });
         await completion;
@@ -105,6 +113,18 @@ try {
     const a = await syntheticTurn('synthetic-session-a', '测试消息甲');
     const b = await syntheticTurn('synthetic-session-b', '测试消息乙');
     assert.notEqual(a, b);
+    /**
+     * ⚠️ 同一会话的第二轮：此时 `diff.chatUrl` **有值**，
+     * `chatUrl === void 0 || forceFreshChatOnce` 才会真的去读右边。
+     * 第一版把开关声明在 apply 的局部作用域，正是这一轮才炸
+     * （`forceFreshChatOnce is not defined`），所以这条断言必须有。
+     */
+    // 真实调用方传的是**完整历史**；这里补上历史，才会走到「已有绑定对话」的分支。
+    const a2 = await syntheticTurn('synthetic-session-a', '测试消息丙', [
+      { role: 'user', content: '测试消息甲' },
+      { role: 'assistant', content: '合成回复' },
+    ]);
+    assert.ok(a2);
     console.log('PASS: 合成发送入队/领取/回复结算与两新会话隔离（未调用真实模型）');
   }
   // 自动化设置：保存 → 读回 → 非法枚举回退

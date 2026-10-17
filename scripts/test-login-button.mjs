@@ -32,6 +32,9 @@ function mount({ tabs = false } = {}) {
   };
   const document = {
     body: {},
+    /** 组件在轮询前会判断可见性；默认可见，测试里可切换。 */
+    visibilityState: 'visible',
+    addEventListener() {}, removeEventListener() {},
     querySelector(selector) {
       if (selector === '[data-conversation-tabs]') { stats.queries++; return tabs ? {} : null; }
       if (selector === '[data-shortcut-modal="settings"]') return { querySelectorAll: () => [{ textContent: 'LDW 网页版', click: () => stats.settingsClicks++ }] };
@@ -80,6 +83,7 @@ function mount({ tabs = false } = {}) {
     mutate(count = 1) { for (let i = 0; i < count; i++) for (const o of observers) if (o.connected) o.fn([]); },
     frame() { const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach(fn => fn()); if (dirty) render(); },
     setTabs(value) { tabs = value; this.mutate(); this.frame(); },
+    setVisible(value) { document.visibilityState = value; },
     unmount() { mounted = false; hooks.forEach(h => h.cleanup?.()); },
   };
 }
@@ -96,7 +100,11 @@ function mount({ tabs = false } = {}) {
   h.setTabs(false); h.tick(30000); assert.equal(h.requests.length, 1, '跨隐藏/显示也不能积累未 settle 请求');
   h.requests[0].resolve({ json: async () => ({ loggedInPlatforms: ['late'] }) });
   await h.flush(); assert.equal(h.tree, null, '过期成功结果不更新状态');
-  h.tick(5000); assert.equal(h.requests.length, 2, 'settle 后才恢复请求');
+  // 轮询间隔已放宽到 60 秒（真机事故后改的）；隐藏时即便到点也不发请求。
+  h.setVisible('hidden');
+  h.tick(60000); assert.equal(h.requests.length, 1, '页面隐藏时不应轮询');
+  h.setVisible('visible');
+  h.tick(60000); assert.equal(h.requests.length, 2, '可见且已有结果后才恢复轮询');
   h.unmount(); assert.equal(h.requests[1].signal.aborted, true); assert.equal(h.timers.size, 0);
 }
 // JSON body 未完成也占用 in-flight；卸载后迟到结果不能写状态。
@@ -134,9 +142,9 @@ function mount({ tabs = false } = {}) {
   assert.equal(h.tree.type, 'button'); assert.equal(h.tree.props.type, 'button');
   assert.equal(h.tree.children[1].children[0], 'LDW 登录');
   h.tree.props.onClick(); await h.flush(); assert.equal(h.stats.settingsClicks, 1);
-  h.tick(5000); h.requests[1].resolve({ json: async () => ({ loggedInPlatforms: ['deepseek'] }) }); await h.flush();
+  h.tick(60000); h.requests[1].resolve({ json: async () => ({ loggedInPlatforms: ['deepseek'] }) }); await h.flush();
   assert.equal(h.tree.children[1].children[0], 'LDW 已登录'); assert.equal(h.tree.children[0].props.className, 'ldw-dot ok');
-  h.tick(5000); h.requests[2].reject(new Error('offline')); await h.flush();
+  h.tick(60000); h.requests[2].reject(new Error('offline')); await h.flush();
   assert.equal(h.tree.children[1].children[0], 'LDW 未就绪'); h.unmount();
 }
 console.log('PASS: LdwLoginButton 未 settle 不积累、超时/卸载 abort、隐藏无 poll、observer rAF 合并、正常按钮语义');
