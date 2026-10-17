@@ -1,4 +1,29 @@
-# 手机 UI 失灵调查（未发布，真实手机实例验收未完成）
+# 手机 UI 失灵调查（已安装 9999.9.45，等你启用）
+
+## 第七轮：已装到你的手机（未启用）
+
+### 重启后怎么确认（不需要你报细节，我自己查）
+
+1. `plugin-activations.json` 里 `dsh-webin-edge-driver` 的 `status` 从 `disabled` 变成加载成功；
+2. App 的 `/app/plugins` 上报里出现 `dsh-webin-edge-driver`（不再 FAILED）；
+3. `curl -o /dev/null -w '%{http_code}' 127.0.0.1:3080/dsh-webin/api/status` 返回 401（路由存在、只是要鉴权）；
+   若是 404 说明 host 半没挂上（半死不活）。
+4. 你看得见的部分：页面能开、能新建会话、设置里 LDW 分区在、模型菜单里有 LDW。
+
+**出问题的回滚**（任选其一）：
+- App 插件管理里停用 → 重启；
+- `cp /root/.dsh/profiles/web/package.json.webin-before-20261017-060319 /root/.dsh/profiles/web/package.json` 后重启。
+
+
+- 修复版已通过官方通道安装：`dsha-plugin import` → `install-preview`，版本 **9999.9.45**。
+- 已装副本校验：`lib/launch-backoff.js`、`lib/login-cookie-probe-worker.js` 均在；
+  `client.js` 里 `window.location.reload` 计数为 0；`verify-package` 28 项全过。
+- 当前状态：**disabled**（`dsh-webin-edge-driver.disabled` 标记在，未进 bundles）。
+  你在 App 插件管理里点「启用」→ 会重建 node_modules 链接并加入 bundles → 重启 Web 才加载。
+- 已推送到 gitcode：`50e841c`（GitHub 从本机不可达，未推）。
+- 回滚材料：旧版整目录 `/root/.dsh/work/backup-webin-999943-20261017-060613`；
+  profile 备份 `/root/.dsh/profiles/web/package.json.webin-before-20261017-060319`。
+- 3080 当前仍正常响应（401 = 需要登录，属正常）。
 
 ## 第六轮：在真实 DSH GUI 上跑起来，并找到「整套界面失灵」的直接机制
 
