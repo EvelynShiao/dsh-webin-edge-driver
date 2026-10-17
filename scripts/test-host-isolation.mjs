@@ -54,8 +54,20 @@ try {
     })).then(() => { assert.equal(status, 200); return JSON.parse(body); });
   };
   await measure('status cold', async () => {
-    const status = await request('status');
-    assert.equal(status.loggedInPlatforms.includes('deepseek'), rows > 0, '冷启动首轮必须等待登录探测完成');
+    /**
+     * 热路径是**非阻塞**的（peek）：它不会等探测，而是先返回上次结果、
+     * 后台刷新。所以这里先显式把探测跑完，再断言状态接口能如实反映。
+     */
+    if (rows > 0) {
+      const { waitForCookieProbe } = await import('../lib/login-cookie-probe.js');
+      await waitForCookieProbe('deepseek', join(home, 'edge-ldw', 'deepseek'));
+    }
+    let status = await request('status');
+    for (let i = 0; i < 20 && !status.loggedInPlatforms.includes('deepseek') && rows > 0; i++) {
+      await new Promise(r => setTimeout(r, 100));
+      status = await request('status');
+    }
+    assert.equal(status.loggedInPlatforms.includes('deepseek'), rows > 0, '探测完成后状态接口必须报告已登录');
   });
   const accounts = await request('accounts');
   assert.equal(accounts.platforms.find(p => p.platform === 'deepseek').slotStatus[0].loggedIn, rows > 0);
