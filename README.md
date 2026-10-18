@@ -6,6 +6,76 @@
 
 ---
 
+## 📦 改造全记录（2026-10-18 三批合辑）
+
+> 本插件经过三批定制改造（全部只动本机已安装文件，不拉外部源码）。
+> 按需求编号记录，每条含实现位置与设计理由。
+
+### 第一批（上午）：八项需求
+
+| # | 需求 | 实现 |
+|---|---|---|
+| 1 | 配置面板大项可折叠、默认收起（省手机渲染） | OFM 插件 `Section` 组件默认 `open:false`，▸/▾ 箭头、键盘可达；`ofm_sec_open` caret 旋转 CSS |
+| 2 | 开机自动启动某账号 | `autoWakeTarget`（"平台#槽位"）+ `autoWakeDelayMs`（默认 45s）；`ctx.effect` 延迟唤醒，失败静默；设置页「开机自启」下拉 |
+| 3 | 闲置多久自动关窗 | `idleShutdownMs` 分钟旋钮（已有）+ 驱动器 `touchIdle` 自动关停 |
+| 4 | 对话自动删除（真删除） | `session-gc.js` 四模式（never/immediate/delay/count）：账本持久化、差集判定只删机器人自建、置顶跳过；UI 全套旋钮 |
+| 5 | 元宝/豆包适配 | 内置 provider 选择器（Quill/tiptap 输入、enterOnly 发送、回复选择器实测校准） |
+| 6 | 纯聊天模式 | `dsh-preset-lite` 新增 `lite-chat` 预设（零工具，只 persona）；工坊 `chat` 槽位 |
+| 7 | 机器标题带 LDW 前缀 | streamOnce 拦 `purpose==="session-title"`，产出强制 `LDW ` 前缀（幂等） |
+| 8 | LDW 快速/思考合并为一个模型 | 单模型 `ldw` + `reasoningEfforts` off(快速)/medium(思考)；`thinkingFor()` 把 effort 翻译成页面开关；旧 id `ldw-fast/think` 靠 `effortFromLegacyId` 兜底 |
+
+### 第二批（下午）：模型自动识别
+
+- 新文件 **`lib/model-autodetect.js`**：探测结果持久化（`webin/detected-models/<平台>.json`，14 天过期）、`slugFromText`（已知代号 hy3/hy4/deepseek/t1/r1 + 中文模式名）、`mergeModels`（叠加不替换、内置兜底）。
+- 驱动器 **`detectPageModels()`**：找模型按钮 → 点开 → 全量读取 → Escape 关闭。
+- 新路由：`POST /providers/:id/detect-models`（busy 409）、`GET /providers/:id/detected-models`。
+- `listModels`/`resolve` 统一走 `effectiveModelsFor()` 合并口径。
+- 设置页「识别模型清单」按钮。
+- 豆包内置改**聊天模式/工作模式**双条目 + off/medium 强度。
+- 顺手修了 lite-plain 在工坊读不到（缺 `workshop:plain` 标记）的旧 bug。
+
+### 第三批（晚上）：双层菜单 + 模式锁定 + 前缀回收 + 分段回放
+
+1. **元宝双层菜单**（用户截图定案）：
+   - 模型层 = Hy3 / Hy4 preview（仅 Expert）/ DeepSeek（`pageModel`）；
+   - 模式层 = Instant / Thinking / Expert（`reasoningEfforts`，即「思考强度」）。
+   - `pageModeFor()` 按 effort 翻译成模式菜单项；`resolvedModelInfo` 支持模型级 efforts 覆盖（Hy4 锁 Expert）。
+   - 驱动器面板操作重构：`_openPanel/_readPanelItems/_pickPanelItem/_closePanel` 通用四步；`applyPageMode`（模式）与 `applyPageModel`（模型，支持展开 Models 子层）分离，**先模式后模型**（元宝切模式会重置模型子菜单）。
+2. **豆包模式锁定**：工作/聊天模式锁在会话上，必须开新窗口才能切。
+   - 游标新增 `pageSig`（`模式#模型` 签名）；变了 ⇒ `forceFresh` ⇒ 丢 `chatUrl` 开新对话 + **全量重发历史**（`diffPrompt` 支持 `forceFresh`）。
+3. **分段回放**（用户设计「一段发过去，暂停 AI 回复，再发另一段」）：
+   - forceFresh 首轮把历史按消息边界切 ≤1200 字符的段挂 `job.replaySegments`；
+   - 驱动器逐段「填字 → 发送 → 立刻点停（buildStopScript）→ 清输入框」，最后才发真问题、正常等完整回复；
+   - 回放残留计入回复基线，`waitForReply` 只认新增那条。
+4. **LDW 前缀识别回收**（用户点名「删除旧对话靠识别带 LDW 的标签」）：
+   - DeepSeek provider 声明 `sessionApi`（列表/删除端点实测来源；`renamePath` 待抓包，占位）；
+   - `renameSession()`：发送后把本轮新建对话改名 `LDW xxx`（runJob 第 11 步，失败静默）；
+   - `purgeByLdwTitle()`：网页列表按前缀删（不置顶）+ **账本孤儿清账**（用户手删过的，本地副本一并抹）；
+   - `/sessions/cleanup` force 模式补扫前缀 + 孤儿；session-gc.js 导出 `looksLikeLdwTitle/pickByLdwTitle`。
+5. **知识库自然语言协议**（用户点名格式，降低风控特征）：
+   - 新预设 `lite-chat-kb`（dsh-preset-lite）：persona + knowledge-sqlite 两个插件（工具面=两层知识库）；
+   - 协议句式：**「我要调动第一层知识库，搜索XX」→ knowledge_search；「我要调动第二层知识库，搜索XX」→ archives_search**；
+   - webin `translateKbProtocol()` 在 parseToolCalls 前把这句话翻译成 ```ldw 调用（严格判据：短文本 + 工具在目录中 + 非空查询）；
+   - 工坊新增 `kb` 槽位（四槽位：dafeyu/plain/chat/kb）。
+6. **压缩 .txt 出口分层**（用户定案「LDW 网页端开关高于全局、但不作用于全局」）：
+   - 新配置键 `ldwCompactionOverride`（空=跟随全局 / never/auto/always=LDW 专用）；
+   - streamOnce 压缩分支优先读它；设置页新「LDW 网页端出口（优先）」下拉（choiceLabels 支持）；
+   - 全局开关（adapter-compat 的出口设置）只写 `compactionFileMode`，与 LDW 专用键互不污染。
+7. **探测升级为两层**：`detectPageModels()` 返回 `modes`（模式层）+ `models`（Models 子层）；`modesFromItems` 映射成 effort 档位；`saveDetected` 存两层；`effectiveEffortsFor()` 把探测到的模式层接进「思考强度」下拉——**模型和思考强度都自动识别**。
+
+### 验证记录
+
+- 全部改动文件 `node --check` 通过（index/edge-driver/client/session-gc/model-autodetect/session-kit）。
+- 测试套件全绿：verify-package(28) / test-slot-names(61) / render-smoke(7组件×2) / login-cookie-probe / login-button / launch-backoff / account-fallback / tool-parse(5) / adapter-compat exit-prefs(5)。
+- preset YAML 用 DSH 同款 yaml 包解析：6 条 insert 全在（lite/plain/v2/v3/chat-kb/chat）；workshop 四槽位标记三件套齐。
+- test-mobile-overlay 跳过（本机无 playwright，环境问题）。
+
+### 备份
+
+`.bak-20261018-ldwbatch/`：第二批前的全部原始文件（lib×5 + package.json + cordis.patch.yml + preset×2 + ofm×2）。
+
+---
+
 ## 这解决什么问题
 
 `dsh-webin` 原版把「真浏览器」这一手交给 **DSH 桌面版（Electron）** 的 webview guest。
