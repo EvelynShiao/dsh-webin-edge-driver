@@ -6,10 +6,22 @@ import { readFileSync } from "node:fs";
 const adapterSrc = readFileSync("C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-adapter-compat/nl-utterance.js", "utf8");
 const webinSrc = readFileSync("C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-webin-edge-driver/lib/index.js", "utf8");
 
-/** 抠 translateKbUtterance + translateToolUtterance + translateUtterance（nl-utterance）*/
+/** 抠 translateKbUtterance + translateToolUtterance + translateUtterance（nl-utterance）
+ *  2026-10-24：nl-utterance.js 加了 `import { enToolName } from './tool-names.js'`——
+ *  new Function 注入时把 import 行剥掉，同时把 tool-names.js 的 enToolName/ZH_TO_EN 一起拼进函数体。 */
+const namesSrc = readFileSync("C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-adapter-compat/tool-names.js", "utf8");
 const idx1 = adapterSrc.indexOf("const UTTERANCE_LEADINS");
 const idx2 = adapterSrc.indexOf("/** 块开头是否疑似");
-const nlFns = adapterSrc.slice(idx1, idx2).replace(/^export function /gm, "function ");
+const nlFns = adapterSrc.slice(idx1, idx2)
+  .replace(/^import .*$/gm, "")
+  .replace(/^export function /gm, "function ");
+/** tool-names 抠 TOOL_ZH_NAMES 表 + enToolName + ZH_TO_EN（enToolName 依赖表，从表定义处全抠）。 */
+const zhIdx1 = namesSrc.indexOf("/** 常用工具中文名表");
+const zhIdx2 = namesSrc.indexOf("/**\n * 给一份工具目录");
+const zhFns = namesSrc.slice(zhIdx1, zhIdx2)
+  .replace(/^export const TOOL_ZH_NAMES/m, "const TOOL_ZH_NAMES")
+  .replace(/^export function /gm, "function ");
+const nlAll = zhFns + "\n" + nlFns;
 
 /** 抠 resolveExitMode（webin）*/
 const mExit = webinSrc.match(/function resolveExitMode\(\)[\s\S]*?\n\t\}/);
@@ -21,7 +33,7 @@ const simulate = (cfg) => {
   const { exitMode, directLimit = 6000, promptLen, txtSentCount, messagesLen, text, tools, kbOn, nlOn } = cfg;
   const out = { actions: [] };
   // ① NL 翻译优先（比 .txt 判定先跑——实际代码里 KB 翻译在回复端、.txt 在发送端，互不抢）
-  const fn = new Function("tools", "kb", "nl", `${nlFns}\nreturn translateUtterance(${JSON.stringify(text)}, tools, { kb, nl });`);
+  const fn = new Function("tools", "kb", "nl", `${nlAll}\nreturn translateUtterance(${JSON.stringify(text)}, tools, { kb, nl });`);
   const hit = fn(tools, kbOn === true, nlOn === true);
   if (hit !== null) { out.actions.push(`NL翻译→${hit.name}`); out.nlHit = true; }
   // ② .txt 出口判定
