@@ -10,7 +10,7 @@
  *   --live 才跑真车道（起浏览器发消息）；缺省只跑离线+已收集实证。
  * 报告输出：桌面 全功能测试报告.md
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 
 const WEBIN_LIB = 'C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-webin-edge-driver/lib';
 const ADAPTER = 'C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-adapter-compat';
@@ -92,6 +92,29 @@ const chunkSrc = readFileSync(WEBIN_LIB + '/txt-chunk.js', 'utf8');
 
 // ═══ B. 真车道层（--live 时跑）═══
 if (LIVE) {
+  // 可见性：每步打印 + 截图存档到 桌面\测试证据\
+  const SHOT_DIR = 'C:/Users/Evelyn/Desktop/测试证据';
+  try { mkdirSync(SHOT_DIR, { recursive: true }); } catch {}
+  const shot = async (label) => {
+    try {
+      const ts = await fetch('http://127.0.0.1:9412/json/list').then(r => r.json()).catch(() => null);
+      const page = ts?.find(t => t.type === 'page' && t.url !== 'about:blank' && t.url !== '');
+      if (!page) return '(无页面可截)';
+      const wsPath = 'C:/Users/Evelyn/AppData/Local/Programs/DeepSeekHarness/dsh/node_modules/@deepseek-ai/dsh/node_modules/ws/index.js';
+      const { default: WebSocket } = await import('file://' + wsPath.replace(/\\/g, '/'));
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      await new Promise(res => ws.on('open', res));
+      let cid = 0; const pend = new Map();
+      ws.on('message', raw => { const m = JSON.parse(raw.toString()); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } });
+      const send = (method, params = {}) => new Promise(res => { const mid = ++cid; pend.set(mid, res); ws.send(JSON.stringify({ id: mid, method, params })); });
+      const s = await send('Page.captureScreenshot', { format: 'png' });
+      const file = `${SHOT_DIR}/${label}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      writeFileSync(file, Buffer.from(s.result.data, 'base64'));
+      ws.close();
+      return file;
+    } catch (e) { return '截图失败: ' + String(e.message || e).slice(0, 60); }
+  };
+  console.log('📸 可见性模式：每步截图存档到 ' + SHOT_DIR);
   // 逐平台 selftest
   const platforms = ['deepseek', 'yuanbao'];
   for (const p of platforms) {
@@ -113,6 +136,7 @@ if (LIVE) {
         if (j?.state === 'failed') { failReason = 'failed'; break; }
       }
       R(p, 'LDW 发送→回复（真车道）', done ? '✅' : '❌', done ? `回复「${text.slice(0, 20)}」` : `未完成 ${failReason}（若失败：检查宿主是否已载入 49f066f——TDZ 修复需重启）`);
+      console.log(`[live] ${p} 截图: ${await shot('live-' + p + '-完成')}`);
     } catch (e) { R(p, 'LDW 发送→回复（真车道）', '❌', String(e.message || e).slice(0, 80)); }
   }
 }
