@@ -46,9 +46,10 @@ const chunkSrc = readFileSync(WEBIN_LIB + '/txt-chunk.js', 'utf8');
 
 // ② 纯文本/纯聊天
 {
-  // API 通道：chatOnly 清 tools（stats 实证已在活宿主见过 stripped=10）
+  // API 通道：chatOnly 清 tools（根因修复 7876009：cordis 瀑布原位 mutate）
   const egressSrc = readFileSync(ADAPTER + '/egress.js', 'utf8');
-  R('API', '纯聊天 chatOnly', egressSrc.includes('tools: []') && egressSrc.includes('chatOnlyStripped') ? '✅' : '❌', '入口清空 tools；活宿主 stats: chatOnlyStripped=10（10-24 实证）');
+  const mutated = egressSrc.includes('options.tools = []') && egressSrc.includes('options.system = ');
+  R('API', '纯聊天 chatOnly', mutated ? '✅' : '❌', mutated ? '原位 mutate（cordis 瀑布 next() 只传原引用——7876009 根因修复）；真瀑布语义测试 7/7；旧 stats 假象作废' : '仍是新对象写法');
   // LDW 通道：lite-chat 预设
   const presetYml = readFileSync('C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-preset-lite/cordis.patch.yml', 'utf8');
   const hasLiteChat = presetYml.includes('id: lite-chat');
