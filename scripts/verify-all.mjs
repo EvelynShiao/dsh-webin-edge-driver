@@ -46,10 +46,10 @@ const chunkSrc = readFileSync(WEBIN_LIB + '/txt-chunk.js', 'utf8');
 
 // ② 纯文本/纯聊天
 {
-  // API 通道：chatOnly 清 tools（根因修复 7876009：cordis 瀑布原位 mutate）
+  // API 通道：chatOnly（c521ec2 终版判据：mutOptions + tools.map 克隆）
   const egressSrc = readFileSync(ADAPTER + '/egress.js', 'utf8');
-  const mutated = egressSrc.includes('options.tools = []') && egressSrc.includes('options.system = ');
-  R('API', '纯聊天 chatOnly', mutated ? '✅' : '❌', mutated ? '原位 mutate（cordis 瀑布 next() 只传原引用——7876009 根因修复）；真瀑布语义测试 7/7；旧 stats 假象作废' : '仍是新对象写法');
+  const mutated = egressSrc.includes('mutOptions.tools = []') && egressSrc.includes('mutOptions.tools = mutOptions.tools.map');
+  R('API', '纯聊天 chatOnly', mutated ? '✅' : '❌', mutated ? 'mutOptions mutate + zhToolNames tools.map 整数组克隆（c521ec2：冻结数组逐项写炸 Cannot assign→map 重挂+try/catch 兜底，冻结测试 5/5+真瀑布 7/7）' : '修复不完整');
   // LDW 通道：lite-chat 预设
   const presetYml = readFileSync('C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plugin-src/dsh-preset-lite/cordis.patch.yml', 'utf8');
   const hasLiteChat = presetYml.includes('id: lite-chat');
