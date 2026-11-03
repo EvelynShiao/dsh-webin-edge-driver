@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/T-Auto/dsh-std/8a15541117cb3c13ddb8f2468308691b6051d162/packages/manifest/schema/dsh-plugin-0.15.schema.json",
+  "manifestVersion": "0.15",
+  "id": "dsh-webin-edge-driver",
+  "name": "dsh-webin-edge-driver",
+  "version": "9999.9.9",
+  "license": "Apache-2.0",
+  "facets": {
+    "host": {
+      "entry": "lib/index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "requires": {
+    "contracts": []
+  },
+  "permissions": [
+    {
+      "name": "dsh-webin-edge-driver.fs.read",
+      "scope": "filesystem-read",
+      "reason": "Read Edge user data, cookies, and credentials"
+    },
+    {
+      "name": "dsh-webin-edge-driver.fs.write",
+      "scope": "dsh-home",
+      "reason": "Write credential store and session artifacts"
+    },
+    {
+      "name": "dsh-webin-edge-driver.process.spawn",
+      "scope": "subprocess",
+      "reason": "Launch Edge via CDP and run automation scripts"
+    }
+  ],
+  "contributes": {
+    "x-display": [
+      {
+        "icon": "./icon.png",
+        "title": "dsh-webin-edge-driver",
+        "description": "Drive local Edge via CDP for DeepSeek / Yuanbao / Qwen / Doubao web UIs",
+        "locales": ["locale/zh.json", "locale/en.json"]
+      }
+    ]
+  },
+  "subscriptions": []
+}

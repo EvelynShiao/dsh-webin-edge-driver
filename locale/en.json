@@ -1,0 +1,4 @@
+{
+  "name": "dsh-webin-edge-driver",
+  "description": "Drive local Edge via CDP for web UIs (DeepSeek / Yuanbao / Qwen / Doubao / custom), providing LDW model capability. Includes login-state cookie detection, unified token/cookie credential file, paste-credential login, and lazy session reclamation."
+}
