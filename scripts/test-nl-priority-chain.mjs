@@ -19,8 +19,10 @@ const nlFns = adapterSrc.slice(idx1, idx2)
 const zhIdx1 = namesSrc.indexOf("/** 常用工具中文名表");
 const zhIdx2 = namesSrc.indexOf("/**\n * 给一份工具目录");
 const zhFns = namesSrc.slice(zhIdx1, zhIdx2)
-  .replace(/^export const TOOL_ZH_NAMES/m, "const TOOL_ZH_NAMES")
-  .replace(/^export function /gm, "function ");
+  /** 2026-11-04：tool-names.js 新增 `export const ZH_TOOL_DESCRIPTIONS` 后，
+   *  旧的「只剥 TOOL_ZH_NAMES 一处」漏掉了它 ⇒ new Function 撞 export 语法错。
+   *  改为统一剥掉行首 `export `（const/function 都覆盖）。 */
+  .replace(/^export /gm, "");
 const nlAll = zhFns + "\n" + nlFns;
 
 /** 抠 resolveExitMode（webin）*/

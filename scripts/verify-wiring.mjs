@@ -5,8 +5,8 @@ const src = readFileSync("C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/plu
 /** 找 listModels 的过滤行——确认代码在 */
 const filterLine = src.includes("m?.legacy !== true");
 console.log("listModels 过滤 legacy 代码在:", filterLine ? "✅" : "❌");
-/** 旧会话解析兜底（resolve 回退 models[0]）也在 */
-const fallback = src.includes("?? provider.models[0]");
+/** 旧会话解析兜底（resolve 回退 specs[0]——重构后变量从 provider.models 改名 specs，两种写法都认） */
+const fallback = src.includes("?? specs[0]") || src.includes("?? provider.models[0]");
 console.log("resolve 旧 id 回退 models[0] 在:", fallback ? "✅" : "❌");
 /** nlToolProtocol 接线 */
 const nlOn = src.includes("nlOn ? translateToolUtterance") || src.includes("translateToolUtterance(replyText0");
