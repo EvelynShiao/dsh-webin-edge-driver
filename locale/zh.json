@@ -1,4 +1,6 @@
 {
-  "name": "dsh-webin-edge-driver",
-  "description": "用 CDP 驱动本机 Edge 运行网页版 AI（DeepSeek / 元宝 / 千问 / 豆包 / 自定义），提供 LDW 模型能力。含登录态 Cookie 判据、统一 Token/Cookie 凭据文件、粘贴凭据登录、会话惰性回收。"
+  "meta": {
+    "title": "Webin Edge Driver",
+    "description": "DSH 插件：用 CDP 驱动本机真 Edge 跑网页版 AI（DeepSeek / 元宝 / 千问 / 豆包 / 自定义），LDW 模型提供方。含登录态 cookie 判据、统一 Token/Cookie 凭据文件、粘贴凭据登录、会话惰性回收。"
+  }
 }
